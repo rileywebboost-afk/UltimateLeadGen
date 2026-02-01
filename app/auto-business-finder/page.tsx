@@ -1,17 +1,18 @@
 /**
  * Auto Business Finder Page
  * Scrapes Google Maps for all generated searches and stores business data
+ * Displays real-time results as they're being scraped
  * Integrates with GitHub Actions for headless browser automation
  */
 
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Sidebar } from '@/components/layout/Sidebar'
-import { AlertCircle, CheckCircle, Clock, Zap } from 'lucide-react'
-
+import { AlertCircle, CheckCircle, Clock, Zap, RefreshCw } from 'lucide-react'
+import { createClient } from '@supabase/supabase-js'
 
 interface ScraperStatus {
   status: 'idle' | 'running' | 'completed' | 'error'
@@ -23,12 +24,59 @@ interface ScraperStatus {
   timestamp?: string
 }
 
+interface Business {
+  id: string
+  title: string
+  address: string
+  phone: string
+  rating: number
+  website: string
+  category: string
+  map_link: string
+  created_at: string
+}
+
 export default function AutoBusinessFinderPage() {
   const [scraperStatus, setScraperStatus] = useState<ScraperStatus>({
     status: 'idle',
     message: 'Ready to start scraping. Click the button below to begin.',
   })
   const [isLoading, setIsLoading] = useState(false)
+  const [businesses, setBusinesses] = useState<Business[]>([])
+  const [workflowId, setWorkflowId] = useState<string | null>(null)
+  const [pollInterval, setPollInterval] = useState<NodeJS.Timeout | null>(null)
+
+  /**
+   * Fetch live businesses from Supabase
+   * Updates in real-time as scraper adds new leads
+   */
+  const fetchLiveBusinesses = async () => {
+    try {
+      const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
+      const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+
+      if (!supabaseUrl || !supabaseKey) {
+        console.error('Supabase credentials not configured')
+        return
+      }
+
+      const supabase = createClient(supabaseUrl, supabaseKey)
+      const { data, error } = await supabase
+        .from('Roofing Leads New')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(50)
+
+      if (error) {
+        console.error('Error fetching businesses:', error)
+        return
+      }
+
+      setBusinesses(data || [])
+    } catch (error) {
+      console.error('Error in fetchLiveBusinesses:', error)
+    }
+  }
 
   /**
    * Triggers the Google Maps scraper via GitHub Actions
@@ -65,24 +113,32 @@ export default function AutoBusinessFinderPage() {
       }
 
       const data = await response.json()
+      setWorkflowId(data.workflowId)
 
       setScraperStatus({
         status: 'running',
-        message: `Scraper started successfully. Workflow ID: ${data.workflowId}. Check GitHub Actions for real-time progress.`,
+        message: `Scraper started successfully. Workflow ID: ${data.workflowId}. Monitoring progress...`,
         progress: { completed: 0, total: 1000 },
         timestamp: new Date().toLocaleTimeString(),
       })
 
-      // Poll for status updates every 30 seconds
-      const pollInterval = setInterval(async () => {
+      // Fetch initial businesses
+      await fetchLiveBusinesses()
+
+      // Poll for status updates every 10 seconds (more frequent for real-time feel)
+      const interval = setInterval(async () => {
         try {
+          // Fetch updated status
           const statusResponse = await fetch(
             `/api/scraper-status?workflowId=${data.workflowId}`
           )
           const statusData = await statusResponse.json()
 
+          // Fetch live businesses count
+          await fetchLiveBusinesses()
+
           if (statusData.status === 'completed') {
-            clearInterval(pollInterval)
+            clearInterval(interval)
             setScraperStatus({
               status: 'completed',
               message: `Scraping completed! ${statusData.businessesFound} businesses found and stored in database.`,
@@ -94,19 +150,32 @@ export default function AutoBusinessFinderPage() {
             })
             setIsLoading(false)
           } else if (statusData.status === 'failed') {
-            clearInterval(pollInterval)
+            clearInterval(interval)
             setScraperStatus({
               status: 'error',
               message: `Scraper failed: ${statusData.error}`,
               timestamp: new Date().toLocaleTimeString(),
             })
             setIsLoading(false)
+          } else {
+            // Update progress with live count
+            setScraperStatus({
+              status: 'running',
+              message: `Scraper running... ${statusData.businessesFound} businesses found so far.`,
+              progress: {
+                completed: statusData.businessesFound,
+                total: 1000,
+              },
+              timestamp: new Date().toLocaleTimeString(),
+            })
           }
         } catch (error) {
           // Continue polling even if status check fails
           console.log('Status check in progress...')
         }
-      }, 30000)
+      }, 10000)
+
+      setPollInterval(interval)
     } catch (error) {
       setScraperStatus({
         status: 'error',
@@ -115,6 +184,13 @@ export default function AutoBusinessFinderPage() {
       })
       setIsLoading(false)
     }
+  }
+
+  /**
+   * Manually refresh the live businesses list
+   */
+  const handleRefreshBusinesses = async () => {
+    await fetchLiveBusinesses()
   }
 
   /**
@@ -160,7 +236,7 @@ export default function AutoBusinessFinderPage() {
           </h1>
           <p className="text-slate-400">
             Scrape Google Maps for all generated searches and automatically
-            store business data
+            store business data with real-time progress tracking
           </p>
         </div>
 
@@ -213,7 +289,8 @@ export default function AutoBusinessFinderPage() {
             <p className="text-slate-400">
               This will scrape all 1000+ generated Google Maps searches using a
               headless browser in GitHub Actions. Business data will be
-              automatically stored in your Supabase database.
+              automatically stored in your Supabase database and displayed below
+              in real-time.
             </p>
           </div>
 
@@ -259,8 +336,7 @@ export default function AutoBusinessFinderPage() {
               <li className="flex items-start gap-2">
                 <span className="text-blue-400 mt-1">•</span>
                 <span>
-                  Marks searches as used (searchUSED = true) to avoid
-                  duplicates
+                  Results appear below in real-time as they&apos;re being scraped
                 </span>
               </li>
             </ul>
@@ -275,6 +351,98 @@ export default function AutoBusinessFinderPage() {
               ? 'Scraper Running...'
               : 'Start Google Maps Scraper'}
           </Button>
+        </Card>
+
+        {/* Live Results Section */}
+        <Card className="bg-slate-900 border-slate-800 p-6 mb-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-2xl font-bold text-white">
+              Live Results ({businesses.length})
+            </h2>
+            <Button
+              onClick={handleRefreshBusinesses}
+              variant="outline"
+              size="sm"
+              className="gap-2"
+            >
+              <RefreshCw size={16} />
+              Refresh
+            </Button>
+          </div>
+
+          {businesses.length === 0 ? (
+            <div className="text-center py-12">
+              <p className="text-slate-400">
+                No businesses found yet. Start the scraper to see results appear
+                here in real-time.
+              </p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-700">
+                    <th className="text-left py-3 px-4 text-slate-300 font-semibold">
+                      Business Name
+                    </th>
+                    <th className="text-left py-3 px-4 text-slate-300 font-semibold">
+                      Address
+                    </th>
+                    <th className="text-left py-3 px-4 text-slate-300 font-semibold">
+                      Phone
+                    </th>
+                    <th className="text-left py-3 px-4 text-slate-300 font-semibold">
+                      Rating
+                    </th>
+                    <th className="text-left py-3 px-4 text-slate-300 font-semibold">
+                      Category
+                    </th>
+                    <th className="text-left py-3 px-4 text-slate-300 font-semibold">
+                      Website
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {businesses.map((business) => (
+                    <tr
+                      key={business.id}
+                      className="border-b border-slate-800 hover:bg-slate-800/50 transition-colors"
+                    >
+                      <td className="py-3 px-4 text-slate-200">
+                        {business.title}
+                      </td>
+                      <td className="py-3 px-4 text-slate-400 text-xs">
+                        {business.address}
+                      </td>
+                      <td className="py-3 px-4 text-slate-400">
+                        {business.phone || '-'}
+                      </td>
+                      <td className="py-3 px-4 text-slate-400">
+                        {business.rating ? `${business.rating}★` : '-'}
+                      </td>
+                      <td className="py-3 px-4 text-slate-400">
+                        {business.category || '-'}
+                      </td>
+                      <td className="py-3 px-4">
+                        {business.website ? (
+                          <a
+                            href={business.website}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-blue-400 hover:text-blue-300 truncate"
+                          >
+                            Visit
+                          </a>
+                        ) : (
+                          <span className="text-slate-500">-</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </Card>
 
         {/* Information Cards */}
@@ -334,7 +502,7 @@ export default function AutoBusinessFinderPage() {
             scalable execution. Monitor progress in your GitHub repository:
           </p>
           <a
-            href="https://github.com/Halfpro6119/UltimateLeadGen/actions"
+            href="https://github.com/rileywebboost-afk/UltimateLeadGen/actions"
             target="_blank"
             rel="noopener noreferrer"
             className="inline-flex items-center gap-2 text-blue-400 hover:text-blue-300 transition-colors"
