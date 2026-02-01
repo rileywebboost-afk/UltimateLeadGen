@@ -34,8 +34,8 @@ const navItems = [
     icon: MapPin,
   },
   {
-    label: 'Auto Lead Researcher',
-    href: '/auto-lead-researcher',
+    label: 'Auto Business Finder',
+    href: '/auto-business-finder',
     icon: Users,
   },
   {

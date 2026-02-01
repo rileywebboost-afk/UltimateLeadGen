@@ -1,0 +1,290 @@
+name: Google Maps Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'start_scraper'
+      timestamp:
+        description: 'Timestamp of request'
+        required: true
+
+jobs:
+  scrape-google-maps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours max runtime
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright pandas python-dotenv
+
+      - name: Install Playwright browsers
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Create scraper script
+        run: |
+          cat > scraper.py << 'SCRAPER_EOF'
+          """
+          Google Maps Scraper for Ultimate Lead Gen
+          
+          This script:
+          1. Fetches all unused searches from Supabase "Google_Maps Searches" table
+          2. Uses headless Playwright browser to scrape Google Maps for each search
+          3. Extracts business data (title, address, phone, rating, website, etc.)
+          4. Stores results in Supabase "Roofing Leads New" table
+          5. Updates searchUSED flag to true for processed searches
+          """
+          
+          import asyncio
+          import os
+          from playwright.async_api import async_playwright
+          from supabase import create_client, Client
+          import json
+          from datetime import datetime
+          
+          # Initialize Supabase client
+          SUPABASE_URL = os.getenv('SUPABASE_URL')
+          SUPABASE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
+          
+          supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+          
+          async def scrape_google_maps_search(page, search_query: str) -> list:
+              """
+              Scrape Google Maps for a specific search query
+              Returns list of business data dictionaries
+              """
+              businesses = []
+              
+              try:
+                  # Navigate to Google Maps with search query
+                  search_url = f"https://www.google.com/maps/search/{search_query.replace(' ', '+')}"
+                  await page.goto(search_url, wait_until='networkidle')
+                  
+                  # Wait for results to load
+                  await page.wait_for_timeout(3000)
+                  
+                  # Extract business listings
+                  # This selector targets the business result cards in Google Maps
+                  business_elements = await page.query_selector_all('[data-item-id]')
+                  
+                  for element in business_elements[:20]:  # Limit to first 20 results per search
+                      try:
+                          # Click on business to open details panel
+                          await element.click()
+                          await page.wait_for_timeout(1000)
+                          
+                          # Extract business information
+                          business_data = await extract_business_details(page)
+                          
+                          if business_data:
+                              businesses.append(business_data)
+                      except Exception as e:
+                          print(f"Error extracting business details: {e}")
+                          continue
+                  
+              except Exception as e:
+                  print(f"Error scraping search '{search_query}': {e}")
+              
+              return businesses
+          
+          async def extract_business_details(page) -> dict:
+              """
+              Extract detailed business information from Google Maps listing
+              """
+              try:
+                  # Extract title
+                  title = await page.text_content('h1')
+                  
+                  # Extract rating
+                  rating_element = await page.query_selector('[aria-label*="stars"]')
+                  rating = await rating_element.text_content() if rating_element else None
+                  
+                  # Extract address
+                  address_element = await page.query_selector('[data-item-id] [aria-label*="address"]')
+                  address = await address_element.text_content() if address_element else None
+                  
+                  # Extract phone
+                  phone_element = await page.query_selector('[data-item-id] [aria-label*="phone"]')
+                  phone_number = await phone_element.text_content() if phone_element else None
+                  
+                  # Extract website
+                  website_element = await page.query_selector('[data-item-id] a[href*="http"]')
+                  webpage = await website_element.get_attribute('href') if website_element else None
+                  
+                  # Extract map link
+                  map_link = page.url
+                  
+                  # Extract category (from breadcrumb or header)
+                  category = None
+                  
+                  # Extract working hours
+                  working_hours = None
+                  
+                  # Extract cover image
+                  cover_image = None
+                  image_element = await page.query_selector('[data-item-id] img')
+                  if image_element:
+                      cover_image = await image_element.get_attribute('src')
+                  
+                  return {
+                      'title': title,
+                      'address': address,
+                      'phone_number': phone_number,
+                      'rating': rating,
+                      'webpage': webpage,
+                      'category': category,
+                      'working_hours': working_hours,
+                      'map_link': map_link,
+                      'cover_image': cover_image,
+                  }
+              except Exception as e:
+                  print(f"Error extracting business details: {e}")
+                  return None
+          
+          async def fetch_unused_searches() -> list:
+              """
+              Fetch all unused searches from Supabase
+              """
+              try:
+                  response = supabase.table('Google_Maps Searches').select('*').eq('searchUSED', False).execute()
+                  return response.data
+              except Exception as e:
+                  print(f"Error fetching searches: {e}")
+                  return []
+          
+          async def store_business_in_database(business_data: dict) -> bool:
+              """
+              Store business data in Supabase "Roofing Leads New" table
+              """
+              try:
+                  # Get next row number
+                  response = supabase.table('Roofing Leads New').select('*').order('RowNumber', desc=True).limit(1).execute()
+                  next_row = (response.data[0]['RowNumber'] + 1) if response.data else 1
+                  
+                  # Prepare data for insertion
+                  data = {
+                      'RowNumber': next_row,
+                      'title': business_data.get('title'),
+                      'address': business_data.get('address'),
+                      'phone_number': business_data.get('phone_number'),
+                      'rating': business_data.get('rating'),
+                      'webpage': business_data.get('webpage'),
+                      'category': business_data.get('category'),
+                      'working_hours': business_data.get('working_hours'),
+                      'map_link': business_data.get('map_link'),
+                      'cover_image': business_data.get('cover_image'),
+                      'Used': False,
+                  }
+                  
+                  # Insert with duplicate handling (unique constraint on normalized title)
+                  supabase.table('Roofing Leads New').insert(data).execute()
+                  return True
+              except Exception as e:
+                  # Duplicate entry - skip silently
+                  if 'duplicate' in str(e).lower():
+                      return True
+                  print(f"Error storing business: {e}")
+                  return False
+          
+          async def mark_search_as_used(search_query: str) -> bool:
+              """
+              Mark search as used in Supabase
+              """
+              try:
+                  supabase.table('Google_Maps Searches').update({'searchUSED': True}).eq('Searches', search_query).execute()
+                  return True
+              except Exception as e:
+                  print(f"Error marking search as used: {e}")
+                  return False
+          
+          async def main():
+              """
+              Main scraper function
+              """
+              print("Starting Google Maps scraper...")
+              
+              # Fetch unused searches
+              searches = await fetch_unused_searches()
+              print(f"Found {len(searches)} unused searches")
+              
+              total_businesses = 0
+              
+              async with async_playwright() as p:
+                  # Launch browser with stealth mode
+                  browser = await p.chromium.launch(headless=True)
+                  context = await browser.new_context(
+                      user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                  )
+                  page = await context.new_page()
+                  
+                  # Process each search
+                  for idx, search in enumerate(searches):
+                      search_query = search['Searches']
+                      print(f"[{idx+1}/{len(searches)}] Scraping: {search_query}")
+                      
+                      try:
+                          # Scrape businesses for this search
+                          businesses = await scrape_google_maps_search(page, search_query)
+                          print(f"  Found {len(businesses)} businesses")
+                          
+                          # Store each business in database
+                          for business in businesses:
+                              if await store_business_in_database(business):
+                                  total_businesses += 1
+                          
+                          # Mark search as used
+                          await mark_search_as_used(search_query)
+                          
+                          # Rate limiting - wait between searches
+                          await page.wait_for_timeout(2000)
+                      except Exception as e:
+                          print(f"  Error processing search: {e}")
+                          continue
+                  
+                  await browser.close()
+              
+              print(f"\nScraping complete! Total businesses stored: {total_businesses}")
+              return total_businesses
+          
+          if __name__ == '__main__':
+              asyncio.run(main())
+          SCRAPER_EOF
+
+      - name: Run scraper
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          python scraper.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: scraper-results
+          path: scraper_results.json
+          retention-days: 30
+
+  notify-completion:
+    needs: scrape-google-maps
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify completion
+        run: |
+          echo "Scraper workflow completed"
+          echo "Status: ${{ needs.scrape-google-maps.result }}"
