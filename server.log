@@ -2,66 +2,11 @@
 > ultimate-lead-gen@0.1.0 dev
 > next dev --turbopack
 
- ⚠ Found lockfile missing swc dependencies, patching...
- ⚠ Port 3000 is in use by an unknown process, using available port 3001 instead.
- ⚠ Lockfile was successfully patched, please run "npm install" to ensure @next/swc dependencies are downloaded
+ ⚠ Port 3000 is in use by an unknown process, using available port 3003 instead.
    ▲ Next.js 15.5.6 (Turbopack)
-   - Local:        http://localhost:3001
-   - Network:      http://169.254.0.21:3001
+   - Local:        http://localhost:3003
+   - Network:      http://169.254.0.21:3003
    - Environments: .env.local
 
  ✓ Starting...
- ✓ Ready in 1713ms
- ○ Compiling / ...
- ✓ Compiled / in 5.1s
- GET / 200 in 2367ms
- GET / 200 in 6121ms
- ⚠ Cross origin request detected from ultimate-lead-gen.lindy.site to /_next/* resource. In a future major version of Next.js, you will need to explicitly configure "allowedDevOrigins" in next.config to allow this.
-Read more: https://nextjs.org/docs/app/api-reference/config/next-config-js/allowedDevOrigins
- ○ Compiling /favicon.ico ...
- ✓ Compiled /favicon.ico in 515ms
- GET /favicon.ico?favicon.bf3c9292.ico 200 in 844ms
- ○ Compiling /google-maps-generator ...
- ✓ Compiled /google-maps-generator in 609ms
- GET /google-maps-generator 200 in 700ms
- ✓ Compiled /api/generate-searches in 196ms
- POST /api/generate-searches 200 in 520ms
- ✓ Compiled /auto-lead-researcher in 424ms
- GET /auto-lead-researcher 200 in 521ms
- ✓ Compiled /auto-outreach in 370ms
- GET /auto-outreach 200 in 464ms
- ✓ Compiled /email-responses in 348ms
- GET /email-responses 200 in 477ms
- ✓ Compiled /auto-website-creator in 467ms
- GET /auto-website-creator 200 in 581ms
- GET / 200 in 118ms
- GET /google-maps-generator 200 in 104ms
- POST /api/generate-searches 200 in 350ms
- ✓ Compiled /api/insert-searches in 370ms
- POST /api/insert-searches 200 in 4273ms
- GET /auto-lead-researcher 200 in 121ms
- GET /auto-lead-researcher 200 in 98ms
- ✓ Compiled in 117ms
- ✓ Compiled in 235ms
- GET / 200 in 615ms
- ✓ Compiled /auto-business-finder in 499ms
- GET /auto-business-finder 200 in 598ms
- GET /auto-business-finder 200 in 298ms
- GET /favicon.ico?favicon.bf3c9292.ico 200 in 338ms
- ✓ Compiled /api/trigger-scraper in 376ms
- POST /api/trigger-scraper 500 in 688ms
- POST /api/trigger-scraper 500 in 263ms
- GET / 200 in 249ms
- GET /google-maps-generator 200 in 228ms
- GET /auto-business-finder 200 in 112ms
- GET / 200 in 130ms
- GET /auto-business-finder 200 in 92ms
- POST /api/trigger-scraper 500 in 263ms
- GET / 200 in 353ms
- GET /auto-business-finder 200 in 177ms
- POST /api/trigger-scraper 500 in 309ms
- POST /api/trigger-scraper 500 in 279ms
- POST /api/trigger-scraper 500 in 277ms
- POST /api/trigger-scraper 500 in 279ms
- POST /api/trigger-scraper 500 in 268ms
- GET / 200 in 223ms
+ ✓ Ready in 1649ms

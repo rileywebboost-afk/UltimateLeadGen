@@ -11,7 +11,7 @@ import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Sidebar } from '@/components/layout/Sidebar'
 import { AlertCircle, CheckCircle, Clock, Zap } from 'lucide-react'
-import { Alert, AlertDescription } from '@/components/ui/alert'
+
 
 interface ScraperStatus {
   status: 'idle' | 'running' | 'completed' | 'error'
@@ -232,7 +232,7 @@ export default function AutoBusinessFinderPage() {
               <li className="flex items-start gap-2">
                 <span className="text-blue-400 mt-1">•</span>
                 <span>
-                  Fetches all unused searches from "Google_Maps Searches" table
+                  Fetches all unused searches from &quot;Google_Maps Searches&quot; table
                 </span>
               </li>
               <li className="flex items-start gap-2">
@@ -252,7 +252,7 @@ export default function AutoBusinessFinderPage() {
               <li className="flex items-start gap-2">
                 <span className="text-blue-400 mt-1">•</span>
                 <span>
-                  Stores all data in "Roofing Leads New" table with unique
+                  Stores all data in &quot;Roofing Leads New&quot; table with unique
                   constraint on normalized title
                 </span>
               </li>
