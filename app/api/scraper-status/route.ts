@@ -21,7 +21,7 @@ export async function GET(request: NextRequest) {
     }
 
     // Get GitHub token from environment
-    const githubToken = process.env.GITHUB_TOKEN
+    const githubToken = process.env.GH_TOKEN
     if (!githubToken) {
       return NextResponse.json(
         { error: 'GitHub token not configured' },
