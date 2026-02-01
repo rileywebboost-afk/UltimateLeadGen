@@ -43,3 +43,18 @@ Read more: https://nextjs.org/docs/app/api-reference/config/next-config-js/allow
  GET /auto-lead-researcher 200 in 98ms
  ✓ Compiled in 117ms
  ✓ Compiled in 235ms
+ GET / 200 in 615ms
+ ✓ Compiled /auto-business-finder in 499ms
+ GET /auto-business-finder 200 in 598ms
+ GET /auto-business-finder 200 in 298ms
+ GET /favicon.ico?favicon.bf3c9292.ico 200 in 338ms
+ ✓ Compiled /api/trigger-scraper in 376ms
+ POST /api/trigger-scraper 500 in 688ms
+ POST /api/trigger-scraper 500 in 263ms
+ GET / 200 in 249ms
+ GET /google-maps-generator 200 in 228ms
+ GET /auto-business-finder 200 in 112ms
+ GET / 200 in 130ms
+ GET /auto-business-finder 200 in 92ms
+ POST /api/trigger-scraper 500 in 263ms
+ GET / 200 in 353ms
