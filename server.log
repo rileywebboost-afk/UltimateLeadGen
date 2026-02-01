@@ -1,0 +1,28 @@
+
+> ultimate-lead-gen@0.1.0 dev
+> next dev --turbopack
+
+ ⚠ Found lockfile missing swc dependencies, patching...
+ ⚠ Port 3000 is in use by an unknown process, using available port 3001 instead.
+ ⚠ Lockfile was successfully patched, please run "npm install" to ensure @next/swc dependencies are downloaded
+   ▲ Next.js 15.5.6 (Turbopack)
+   - Local:        http://localhost:3001
+   - Network:      http://169.254.0.21:3001
+   - Environments: .env.local
+
+ ✓ Starting...
+ ✓ Ready in 1713ms
+ ○ Compiling / ...
+ ✓ Compiled / in 5.1s
+ GET / 200 in 2367ms
+ GET / 200 in 6121ms
+ ⚠ Cross origin request detected from ultimate-lead-gen.lindy.site to /_next/* resource. In a future major version of Next.js, you will need to explicitly configure "allowedDevOrigins" in next.config to allow this.
+Read more: https://nextjs.org/docs/app/api-reference/config/next-config-js/allowedDevOrigins
+ ○ Compiling /favicon.ico ...
+ ✓ Compiled /favicon.ico in 515ms
+ GET /favicon.ico?favicon.bf3c9292.ico 200 in 844ms
+ ○ Compiling /google-maps-generator ...
+ ✓ Compiled /google-maps-generator in 609ms
+ GET /google-maps-generator 200 in 700ms
+ ✓ Compiled /api/generate-searches in 196ms
+ POST /api/generate-searches 200 in 520ms
