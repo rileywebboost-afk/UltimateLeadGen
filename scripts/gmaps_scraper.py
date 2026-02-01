@@ -26,6 +26,9 @@ from typing import Any, Optional
 from playwright.async_api import async_playwright, Page, TimeoutError as PwTimeout
 from supabase import create_client
 
+# Monitoring: write real-time progress + event timeline to Supabase
+from scripts.scraper_monitor import build_monitor
+
 
 # ----------------------------
 # Config
@@ -293,7 +296,26 @@ async def scrape_search(page: Page, query: str) -> tuple[list[Business], bool, s
 
 async def run() -> dict[str, Any]:
     started = datetime.now().isoformat()
+
+    # Build monitoring helper (safe no-op if RUN_KEY env var is missing)
+    monitor = build_monitor(supabase)
+    if monitor:
+        monitor.upsert_progress({
+            "status": "initializing",
+            "current_action": "boot",
+            "started_at": started,
+        })
+        monitor.add_event("INIT", "Scraper initializing (Playwright + Supabase)")
+
     searches = fetch_unused_searches(limit=1000)
+
+    if monitor:
+        monitor.upsert_progress({
+            "status": "running",
+            "current_action": "loaded_search_queue",
+            "total_searches": len(searches),
+        })
+        monitor.add_event("QUEUE", f"Loaded {len(searches)} unused searches from Supabase")
 
     results: dict[str, Any] = {
         "started_at": started,
@@ -329,8 +351,37 @@ async def run() -> dict[str, Any]:
 
         for idx, s in enumerate(searches):
             query = s["Searches"]
+
+            # ---------------------------------------------------------
+            # Monitoring: announce which search we are about to run.
+            # This is the key missing piece for UI visibility.
+            # ---------------------------------------------------------
+            if monitor:
+                monitor.upsert_progress({
+                    "status": "running",
+                    "current_action": "loading_search",
+                    "current_search": query,
+                    "current_search_index": idx + 1,
+                    "total_searches": len(searches),
+                    "searches_processed": idx,
+                    "businesses_extracted": results["businesses_extracted"],
+                    "businesses_inserted_or_skipped": results["businesses_inserted_or_skipped"],
+                    "searches_marked_used": results["searches_marked_used"],
+                    "searches_loaded_ok": results["searches_loaded_ok"],
+                    "searches_errors": results["searches_errors"],
+                })
+                monitor.add_event(
+                    "SEARCH_START",
+                    f"Starting search: {query}",
+                    search=query,
+                    search_index=idx + 1,
+                )
+
             print(f"[{idx+1}/{len(searches)}] {query}")
 
+            # ---------------------------------------------------------
+            # Run the actual Google Maps scraping for this search.
+            # ---------------------------------------------------------
             businesses, loaded_ok, err = await scrape_search(page, query)
 
             if loaded_ok:
@@ -341,9 +392,39 @@ async def run() -> dict[str, Any]:
                 if len(results["sample_errors"]) < 25:
                     results["sample_errors"].append({"search": query, "error": err})
 
+                if monitor:
+                    monitor.add_event(
+                        "SEARCH_ERROR",
+                        f"Search produced an error: {err}",
+                        level="warn",
+                        search=query,
+                        search_index=idx + 1,
+                    )
+
+            # ---------------------------------------------------------
+            # Monitoring: how many businesses did we extract?
+            # ---------------------------------------------------------
             results["businesses_extracted"] += len(businesses)
 
-            # Insert businesses
+            if monitor:
+                monitor.upsert_progress({
+                    "current_action": "extracted_businesses",
+                    "businesses_extracted": results["businesses_extracted"],
+                    "searches_loaded_ok": results["searches_loaded_ok"],
+                    "searches_errors": results["searches_errors"],
+                })
+                monitor.add_event(
+                    "EXTRACT",
+                    f"Extracted {len(businesses)} businesses",
+                    search=query,
+                    search_index=idx + 1,
+                    businesses_extracted=len(businesses),
+                )
+
+            # ---------------------------------------------------------
+            # Insert businesses into Supabase
+            # ---------------------------------------------------------
+            inserted_this_search = 0
             for b in businesses:
                 row = {
                     "RowNumber": row_number,
@@ -361,20 +442,84 @@ async def run() -> dict[str, Any]:
                 ok = insert_roofing_lead(row)
                 if ok:
                     results["businesses_inserted_or_skipped"] += 1
+                    inserted_this_search += 1
                 row_number += 1
 
-            # Mark used only if the page loaded and we saw a results container (loaded_ok)
+            if monitor:
+                monitor.upsert_progress({
+                    "current_action": "inserted_businesses",
+                    "businesses_inserted_or_skipped": results["businesses_inserted_or_skipped"],
+                })
+                monitor.add_event(
+                    "DB_INSERT",
+                    f"Inserted/skipped {inserted_this_search} businesses into Roofing Leads New",
+                    search=query,
+                    search_index=idx + 1,
+                    businesses_inserted_or_skipped=inserted_this_search,
+                )
+
+            # ---------------------------------------------------------
+            # Mark search used ONLY if we successfully loaded results.
+            # ---------------------------------------------------------
             if loaded_ok:
+                if monitor:
+                    monitor.upsert_progress({
+                        "current_action": "marking_search_used",
+                    })
+
                 mark_search_used(query)
                 results["searches_marked_used"] += 1
 
-            # Gentle pacing
+                if monitor:
+                    monitor.upsert_progress({
+                        "current_action": "search_marked_used",
+                        "searches_marked_used": results["searches_marked_used"],
+                    })
+                    monitor.add_event(
+                        "SEARCH_MARK_USED",
+                        "Marked search as used in Google_Maps Searches",
+                        search=query,
+                        search_index=idx + 1,
+                        searches_marked_used=1,
+                    )
+
+            # ---------------------------------------------------------
+            # Gentle pacing (and a convenient heartbeat for monitoring)
+            # ---------------------------------------------------------
+            if monitor:
+                monitor.upsert_progress({
+                    "searches_processed": idx + 1,
+                    "current_action": "waiting_between_searches",
+                })
+
             await page.wait_for_timeout(750)
+
+
+        
 
         await context.close()
         await browser.close()
 
     results["finished_at"] = datetime.now().isoformat()
+
+    # Monitoring: mark run completed
+    if monitor:
+        monitor.upsert_progress({
+            "status": "completed",
+            "current_action": "completed",
+            "businesses_extracted": results["businesses_extracted"],
+            "businesses_inserted_or_skipped": results["businesses_inserted_or_skipped"],
+            "searches_loaded_ok": results["searches_loaded_ok"],
+            "searches_errors": results["searches_errors"],
+            "searches_marked_used": results["searches_marked_used"],
+            "searches_processed": results["searches_total"],
+            "completed_at": results["finished_at"],
+        })
+        monitor.add_event(
+            "COMPLETE",
+            f"Scraper completed. Inserted/skipped {results['businesses_inserted_or_skipped']} total businesses.",
+        )
+
     return results
 
 
@@ -394,6 +539,25 @@ if __name__ == "__main__":
             "status": "fatal_error",
             "error": str(e),
         }
+
+        # Monitoring: mark run failed (best-effort)
+        try:
+            monitor = build_monitor(supabase)
+            if monitor:
+                monitor.upsert_progress({
+                    "status": "failed",
+                    "current_action": "failed",
+                    "error_message": str(e)[:500],
+                    "completed_at": out["finished_at"],
+                })
+                monitor.add_event(
+                    "FATAL",
+                    f"Scraper crashed: {str(e)[:200]}",
+                    level="error",
+                )
+        except Exception:
+            pass
+
         raise
     finally:
         # Always create results file for artifact upload

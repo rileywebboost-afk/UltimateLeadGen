@@ -1,64 +1,120 @@
 /**
  * Auto Business Finder Page
- * Scrapes Google Maps for all generated searches and stores business data
- * Displays real-time results as they're being scraped
- * Integrates with GitHub Actions for headless browser automation
+ *
+ * What the user expects:
+ * - Not just "running" vs "completed".
+ * - They want to SEE what GitHub Actions / the scraper is doing:
+ *   - initializing
+ *   - which search is currently being processed
+ *   - how many businesses were extracted and inserted
+ *   - when searches are marked as used
+ *   - when the run finishes or fails
+ *
+ * Implementation:
+ * - We still trigger GitHub Actions via /api/trigger-scraper
+ * - We now also poll /api/scraper-progress?runKey=... which reads a
+ *   Supabase-backed monitoring timeline written by the scraper itself.
  */
 
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Sidebar } from '@/components/layout/Sidebar'
-import { AlertCircle, CheckCircle, Clock, Zap, RefreshCw } from 'lucide-react'
+import {
+  AlertCircle,
+  CheckCircle,
+  Clock,
+  RefreshCw,
+  Zap,
+  ListChecks,
+} from 'lucide-react'
 import { createClient } from '@supabase/supabase-js'
 
-interface ScraperStatus {
-  status: 'idle' | 'running' | 'completed' | 'error'
+type UiStatus = 'idle' | 'initializing' | 'running' | 'completed' | 'error'
+
+interface ScraperProgressRow {
+  run_key: string
+  github_run_id?: string | null
+  status: 'initializing' | 'running' | 'completed' | 'failed'
+  current_action?: string | null
+  current_search?: string | null
+  current_search_index?: number | null
+  total_searches?: number | null
+  businesses_extracted?: number | null
+  businesses_inserted_or_skipped?: number | null
+  searches_loaded_ok?: number | null
+  searches_errors?: number | null
+  searches_marked_used?: number | null
+  searches_processed?: number | null
+  error_message?: string | null
+  started_at?: string | null
+  updated_at?: string | null
+  completed_at?: string | null
+}
+
+interface ScraperEventRow {
+  id: number
+  run_key: string
+  level: 'info' | 'warn' | 'error'
+  event_type: string
   message: string
-  progress?: {
-    completed: number
-    total: number
-  }
-  timestamp?: string
+  search?: string | null
+  search_index?: number | null
+  businesses_extracted?: number | null
+  businesses_inserted_or_skipped?: number | null
+  searches_marked_used?: number | null
+  created_at: string
 }
 
 interface Business {
   id: string
   title: string
   address: string
-  phone: string
-  rating: number
-  website: string
-  category: string
-  map_link: string
+  phone_number?: string | null
+  rating?: string | null
+  webpage?: string | null
+  category?: string | null
+  map_link?: string | null
   created_at: string
 }
 
 export default function AutoBusinessFinderPage() {
-  const [scraperStatus, setScraperStatus] = useState<ScraperStatus>({
-    status: 'idle',
-    message: 'Ready to start scraping. Click the button below to begin.',
-  })
+  const [uiStatus, setUiStatus] = useState<UiStatus>('idle')
+  const [statusMessage, setStatusMessage] = useState(
+    'Ready to start scraping. Click the button below to begin.'
+  )
   const [isLoading, setIsLoading] = useState(false)
-  const [businesses, setBusinesses] = useState<Business[]>([])
+
+  // The stable identifier returned by /api/trigger-scraper (ISO timestamp)
+  const [runKey, setRunKey] = useState<string | null>(null)
+
+  // Optional: GitHub run id for link-out
   const [workflowId, setWorkflowId] = useState<string | null>(null)
-  const [pollInterval, setPollInterval] = useState<NodeJS.Timeout | null>(null)
+
+  // Supabase-backed monitoring data
+  const [progress, setProgress] = useState<ScraperProgressRow | null>(null)
+  const [events, setEvents] = useState<ScraperEventRow[]>([])
+
+  // Live businesses table
+  const [businesses, setBusinesses] = useState<Business[]>([])
+
+  // Keep track of polling interval so we can stop it
+  const pollRef = useRef<NodeJS.Timeout | null>(null)
 
   /**
-   * Fetch live businesses from Supabase
-   * Updates in real-time as scraper adds new leads
+   * Fetch live businesses from Supabase so the user sees rows being added.
+   *
+   * NOTE: This requires NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY
+   * to be configured (client-side).
    */
   const fetchLiveBusinesses = async () => {
     try {
       const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
       const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
 
-      if (!supabaseUrl || !supabaseKey) {
-        console.error('Supabase credentials not configured')
-        return
-      }
+      if (!supabaseUrl || !supabaseKey) return
 
       const supabase = createClient(supabaseUrl, supabaseKey)
       const { data, error } = await supabase
@@ -67,137 +123,127 @@ export default function AutoBusinessFinderPage() {
         .order('created_at', { ascending: false })
         .limit(50)
 
-      if (error) {
-        console.error('Error fetching businesses:', error)
-        return
-      }
-
-      setBusinesses(data || [])
-    } catch (error) {
-      console.error('Error in fetchLiveBusinesses:', error)
+      if (!error) setBusinesses((data as any) || [])
+    } catch {
+      // ignore - we still can show progress without businesses list
     }
   }
 
   /**
-   * Triggers the Google Maps scraper via GitHub Actions
-   * This will:
-   * 1. Fetch all unused searches from Supabase
-   * 2. Use headless browser to scrape Google Maps for each search
-   * 3. Extract business data (title, address, phone, rating, etc.)
-   * 4. Store results in "Roofing Leads New" table
-   * 5. Mark searches as used in "Google_Maps Searches" table
+   * Poll Supabase monitoring API for detailed scraper progress + event timeline.
+   */
+  const fetchProgress = async (rk: string) => {
+    const res = await fetch(`/api/scraper-progress?runKey=${encodeURIComponent(rk)}`)
+    if (!res.ok) return
+
+    const data = await res.json()
+    setProgress(data.progress)
+    setEvents(data.events || [])
+
+    // Update UI status + message based on progress
+    const p: ScraperProgressRow | null = data.progress
+
+    if (!p) {
+      setUiStatus('initializing')
+      setStatusMessage('Scraper started. Waiting for first progress update…')
+      return
+    }
+
+    if (p.status === 'failed') {
+      setUiStatus('error')
+      setStatusMessage(p.error_message || 'Scraper failed. Check timeline for details.')
+      setIsLoading(false)
+      return
+    }
+
+    if (p.status === 'completed') {
+      setUiStatus('completed')
+      setStatusMessage(
+        `Completed: inserted/skipped ${p.businesses_inserted_or_skipped ?? 0} businesses. Marked used ${p.searches_marked_used ?? 0} searches.`
+      )
+      setIsLoading(false)
+      // Stop polling once completed
+      if (pollRef.current) {
+        clearInterval(pollRef.current)
+        pollRef.current = null
+      }
+      return
+    }
+
+    // initializing/running
+    setUiStatus(p.status === 'initializing' ? 'initializing' : 'running')
+
+    const searchPart = p.current_search
+      ? `Current search: “${p.current_search}” (${p.current_search_index ?? '?'}/${p.total_searches ?? '?'})`
+      : 'Preparing search…'
+
+    const counters = `Extracted: ${p.businesses_extracted ?? 0} • Inserted/skipped: ${
+      p.businesses_inserted_or_skipped ?? 0
+    } • Searches used: ${p.searches_marked_used ?? 0}`
+
+    setStatusMessage(`${searchPart} • ${p.current_action || 'working'} • ${counters}`)
+  }
+
+  /**
+   * Trigger the GitHub Actions scraper.
    */
   const handleStartScraper = async () => {
     setIsLoading(true)
-    setScraperStatus({
-      status: 'running',
-      message: 'Initializing scraper... This may take several minutes.',
-      progress: { completed: 0, total: 1000 },
-    })
+    setUiStatus('initializing')
+
+    // Stable run key used for monitoring.
+    // Using ISO timestamp keeps it human readable + unique.
+    const newRunKey = new Date().toISOString()
+    setRunKey(newRunKey)
+
+    setStatusMessage('Triggering GitHub Actions workflow…')
 
     try {
-      // Call API endpoint to trigger scraper
       const response = await fetch('/api/trigger-scraper', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'start_scraper',
-          timestamp: new Date().toISOString(),
+          timestamp: newRunKey,
         }),
       })
 
-      if (!response.ok) {
-        throw new Error(`API error: ${response.status}`)
-      }
+      if (!response.ok) throw new Error(`API error: ${response.status}`)
 
       const data = await response.json()
-      setWorkflowId(data.workflowId)
+      setWorkflowId(data.workflowId || null)
+      setRunKey(data.runKey || newRunKey)
 
-      setScraperStatus({
-        status: 'running',
-        message: `Scraper started successfully. Workflow ID: ${data.workflowId}. Monitoring progress...`,
-        progress: { completed: 0, total: 1000 },
-        timestamp: new Date().toLocaleTimeString(),
-      })
+      setStatusMessage('Workflow dispatched. Waiting for scraper initialization…')
 
-      // Fetch initial businesses
-      await fetchLiveBusinesses()
+      // Start polling progress + businesses
+      if (pollRef.current) clearInterval(pollRef.current)
 
-      // Poll for status updates every 10 seconds (more frequent for real-time feel)
-      const interval = setInterval(async () => {
-        try {
-          // Fetch updated status
-          const statusResponse = await fetch(
-            `/api/scraper-status?workflowId=${data.workflowId}`
-          )
-          const statusData = await statusResponse.json()
-
-          // Fetch live businesses count
-          await fetchLiveBusinesses()
-
-          if (statusData.status === 'completed') {
-            clearInterval(interval)
-            setScraperStatus({
-              status: 'completed',
-              message: `Scraping completed! ${statusData.businessesFound} businesses found and stored in database.`,
-              progress: {
-                completed: statusData.businessesFound,
-                total: 1000,
-              },
-              timestamp: new Date().toLocaleTimeString(),
-            })
-            setIsLoading(false)
-          } else if (statusData.status === 'failed') {
-            clearInterval(interval)
-            setScraperStatus({
-              status: 'error',
-              message: `Scraper failed: ${statusData.error}`,
-              timestamp: new Date().toLocaleTimeString(),
-            })
-            setIsLoading(false)
-          } else {
-            // Update progress with live count
-            setScraperStatus({
-              status: 'running',
-              message: `Scraper running... ${statusData.businessesFound} businesses found so far.`,
-              progress: {
-                completed: statusData.businessesFound,
-                total: 1000,
-              },
-              timestamp: new Date().toLocaleTimeString(),
-            })
-          }
-        } catch (error) {
-          // Continue polling even if status check fails
-          console.log('Status check in progress...')
+      pollRef.current = setInterval(async () => {
+        if (data.runKey) {
+          await fetchProgress(data.runKey)
+        } else {
+          await fetchProgress(newRunKey)
         }
-      }, 10000)
+        await fetchLiveBusinesses()
+      }, 5000)
 
-      setPollInterval(interval)
-    } catch (error) {
-      setScraperStatus({
-        status: 'error',
-        message: `Error starting scraper: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        timestamp: new Date().toLocaleTimeString(),
-      })
+      // Kick off immediately
+      await fetchProgress(data.runKey || newRunKey)
+      await fetchLiveBusinesses()
+    } catch (e) {
+      setUiStatus('error')
+      setStatusMessage(
+        `Error starting scraper: ${e instanceof Error ? e.message : 'Unknown error'}`
+      )
       setIsLoading(false)
     }
   }
 
-  /**
-   * Manually refresh the live businesses list
-   */
-  const handleRefreshBusinesses = async () => {
-    await fetchLiveBusinesses()
-  }
-
-  /**
-   * Get status badge color based on current status
-   */
   const getStatusColor = () => {
-    switch (scraperStatus.status) {
+    switch (uiStatus) {
+      case 'initializing':
+        return 'bg-purple-500/10 border-purple-500/20'
       case 'running':
         return 'bg-blue-500/10 border-blue-500/20'
       case 'completed':
@@ -209,11 +255,10 @@ export default function AutoBusinessFinderPage() {
     }
   }
 
-  /**
-   * Get status icon based on current status
-   */
   const getStatusIcon = () => {
-    switch (scraperStatus.status) {
+    switch (uiStatus) {
+      case 'initializing':
+        return <Clock className="text-purple-400 animate-spin" size={20} />
       case 'running':
         return <Clock className="text-blue-400 animate-spin" size={20} />
       case 'completed':
@@ -223,6 +268,32 @@ export default function AutoBusinessFinderPage() {
       default:
         return <Zap className="text-slate-400" size={20} />
     }
+  }
+
+  // Progress % is computed from searches_processed / total_searches (not fixed 1000)
+  const progressPct = useMemo(() => {
+    const done = progress?.searches_processed ?? 0
+    const total = progress?.total_searches ?? 0
+    if (!total) return 0
+    return Math.min(100, Math.round((done / total) * 100))
+  }, [progress?.searches_processed, progress?.total_searches])
+
+  const githubRunLink = useMemo(() => {
+    const id = progress?.github_run_id || workflowId
+    if (!id || id === 'unknown') return null
+    return `https://github.com/rileywebboost-afk/UltimateLeadGen/actions/runs/${id}`
+  }, [progress?.github_run_id, workflowId])
+
+  // Cleanup polling on unmount
+  useEffect(() => {
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current)
+    }
+  }, [])
+
+  const handleRefresh = async () => {
+    if (runKey) await fetchProgress(runKey)
+    await fetchLiveBusinesses()
   }
 
   return (
@@ -235,8 +306,8 @@ export default function AutoBusinessFinderPage() {
             Auto Business Finder
           </h1>
           <p className="text-slate-400">
-            Scrape Google Maps for all generated searches and automatically
-            store business data with real-time progress tracking
+            Scrape Google Maps for all generated searches and automatically store
+            business data with deep, real-time workflow visibility.
           </p>
         </div>
 
@@ -245,122 +316,179 @@ export default function AutoBusinessFinderPage() {
           <div className="flex items-start gap-4">
             <div className="mt-1">{getStatusIcon()}</div>
             <div className="flex-1">
-              <h3 className="text-lg font-semibold text-white mb-1">
-                Scraper Status
-              </h3>
-              <p className="text-slate-300 mb-2">{scraperStatus.message}</p>
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h3 className="text-lg font-semibold text-white mb-1">
+                    Scraper Status
+                  </h3>
+                  <p className="text-slate-300 mb-2">{statusMessage}</p>
+
+                  {runKey && (
+                    <p className="text-xs text-slate-500">
+                      Run Key: <span className="text-slate-300">{runKey}</span>
+                    </p>
+                  )}
+
+                  {githubRunLink && (
+                    <a
+                      className="text-xs text-blue-400 hover:text-blue-300"
+                      href={githubRunLink}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      View GitHub Run →
+                    </a>
+                  )}
+                </div>
+
+                <Button
+                  onClick={handleRefresh}
+                  variant="outline"
+                  size="sm"
+                  className="gap-2"
+                >
+                  <RefreshCw size={16} />
+                  Refresh
+                </Button>
+              </div>
 
               {/* Progress Bar */}
-              {scraperStatus.progress && (
+              {progress?.total_searches ? (
                 <div className="mt-4">
                   <div className="flex justify-between text-sm text-slate-400 mb-2">
-                    <span>Progress</span>
+                    <span>Search Progress</span>
                     <span>
-                      {scraperStatus.progress.completed} /{' '}
-                      {scraperStatus.progress.total}
+                      {progress.searches_processed ?? 0} /{' '}
+                      {progress.total_searches ?? 0} ({progressPct}%)
                     </span>
                   </div>
                   <div className="w-full bg-slate-800 rounded-full h-2">
                     <div
                       className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-                      style={{
-                        width: `${(scraperStatus.progress.completed / scraperStatus.progress.total) * 100}%`,
-                      }}
+                      style={{ width: `${progressPct}%` }}
                     />
                   </div>
-                </div>
-              )}
 
-              {scraperStatus.timestamp && (
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
+                    <div className="bg-slate-900/40 border border-slate-800 rounded-lg p-3">
+                      <div className="text-xs text-slate-500">Extracted</div>
+                      <div className="text-white font-semibold">
+                        {progress.businesses_extracted ?? 0}
+                      </div>
+                    </div>
+                    <div className="bg-slate-900/40 border border-slate-800 rounded-lg p-3">
+                      <div className="text-xs text-slate-500">Inserted/Skipped</div>
+                      <div className="text-white font-semibold">
+                        {progress.businesses_inserted_or_skipped ?? 0}
+                      </div>
+                    </div>
+                    <div className="bg-slate-900/40 border border-slate-800 rounded-lg p-3">
+                      <div className="text-xs text-slate-500">Searches Used</div>
+                      <div className="text-white font-semibold">
+                        {progress.searches_marked_used ?? 0}
+                      </div>
+                    </div>
+                    <div className="bg-slate-900/40 border border-slate-800 rounded-lg p-3">
+                      <div className="text-xs text-slate-500">Errors</div>
+                      <div className="text-white font-semibold">
+                        {progress.searches_errors ?? 0}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+
+              {progress?.updated_at && (
                 <p className="text-xs text-slate-500 mt-3">
-                  Last updated: {scraperStatus.timestamp}
+                  Last updated: {new Date(progress.updated_at).toLocaleString()}
                 </p>
               )}
             </div>
           </div>
         </Card>
 
-        {/* Main Control Card */}
+        {/* Start Card */}
         <Card className="bg-slate-900 border-slate-800 p-8 mb-6">
           <div className="mb-6">
             <h2 className="text-2xl font-bold text-white mb-2">
               Start Google Maps Scraper
             </h2>
             <p className="text-slate-400">
-              This will scrape all 1000+ generated Google Maps searches using a
-              headless browser in GitHub Actions. Business data will be
-              automatically stored in your Supabase database and displayed below
-              in real-time.
+              Triggers a GitHub Actions workflow that scrapes Google Maps.
+              This page will now show a live timeline of what the workflow is
+              doing.
             </p>
-          </div>
-
-          <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-4 mb-6">
-            <h3 className="text-sm font-semibold text-white mb-3">
-              What happens when you click start:
-            </h3>
-            <ul className="space-y-2 text-sm text-slate-300">
-              <li className="flex items-start gap-2">
-                <span className="text-blue-400 mt-1">•</span>
-                <span>
-                  GitHub Actions workflow triggers with headless Playwright
-                  browser
-                </span>
-              </li>
-              <li className="flex items-start gap-2">
-                <span className="text-blue-400 mt-1">•</span>
-                <span>
-                  Fetches all unused searches from &quot;Google_Maps Searches&quot; table
-                </span>
-              </li>
-              <li className="flex items-start gap-2">
-                <span className="text-blue-400 mt-1">•</span>
-                <span>
-                  Inputs each search into Google Maps and scrapes business
-                  results
-                </span>
-              </li>
-              <li className="flex items-start gap-2">
-                <span className="text-blue-400 mt-1">•</span>
-                <span>
-                  Extracts: Title, Address, Phone, Rating, Website, Category,
-                  Working Hours, Map Link, Cover Image
-                </span>
-              </li>
-              <li className="flex items-start gap-2">
-                <span className="text-blue-400 mt-1">•</span>
-                <span>
-                  Stores all data in &quot;Roofing Leads New&quot; table with unique
-                  constraint on normalized title
-                </span>
-              </li>
-              <li className="flex items-start gap-2">
-                <span className="text-blue-400 mt-1">•</span>
-                <span>
-                  Results appear below in real-time as they&apos;re being scraped
-                </span>
-              </li>
-            </ul>
           </div>
 
           <Button
             onClick={handleStartScraper}
-            disabled={isLoading || scraperStatus.status === 'running'}
+            disabled={isLoading || uiStatus === 'running' || uiStatus === 'initializing'}
             className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-700 disabled:cursor-not-allowed text-white font-semibold py-3 rounded-lg transition-colors"
           >
-            {isLoading || scraperStatus.status === 'running'
-              ? 'Scraper Running...'
+            {isLoading || uiStatus === 'running' || uiStatus === 'initializing'
+              ? 'Scraper Running…'
               : 'Start Google Maps Scraper'}
           </Button>
         </Card>
 
-        {/* Live Results Section */}
+        {/* Live Timeline */}
+        <Card className="bg-slate-900 border-slate-800 p-6 mb-6">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <ListChecks className="text-slate-300" size={18} />
+              <h2 className="text-xl font-bold text-white">Live Timeline</h2>
+            </div>
+            <div className="text-xs text-slate-500">
+              Showing last {events.length} events
+            </div>
+          </div>
+
+          {events.length === 0 ? (
+            <div className="text-center py-10 text-slate-400">
+              Timeline will populate once the workflow begins writing progress.
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {events.slice(0, 12).map((evt) => (
+                <div
+                  key={evt.id}
+                  className="flex items-start justify-between gap-3 bg-slate-950/40 border border-slate-800 rounded-lg p-3"
+                >
+                  <div>
+                    <div className="text-sm text-white">
+                      <span className="text-slate-400">[{evt.event_type}]</span>{' '}
+                      {evt.message}
+                    </div>
+                    <div className="text-xs text-slate-500 mt-1">
+                      {new Date(evt.created_at).toLocaleString()}
+                      {evt.search ? ` • ${evt.search}` : ''}
+                    </div>
+                  </div>
+                  <div
+                    className={`text-xs px-2 py-1 rounded border ${
+                      evt.level === 'error'
+                        ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                        : evt.level === 'warn'
+                          ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                          : 'border-slate-700 bg-slate-900/30 text-slate-300'
+                    }`}
+                  >
+                    {evt.level}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+
+        {/* Live Results */}
         <Card className="bg-slate-900 border-slate-800 p-6 mb-6">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-2xl font-bold text-white">
               Live Results ({businesses.length})
             </h2>
             <Button
-              onClick={handleRefreshBusinesses}
+              onClick={fetchLiveBusinesses}
               variant="outline"
               size="sm"
               className="gap-2"
@@ -374,7 +502,7 @@ export default function AutoBusinessFinderPage() {
             <div className="text-center py-12">
               <p className="text-slate-400">
                 No businesses found yet. Start the scraper to see results appear
-                here in real-time.
+                here.
               </p>
             </div>
           ) : (
@@ -403,33 +531,31 @@ export default function AutoBusinessFinderPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {businesses.map((business) => (
+                  {businesses.map((b) => (
                     <tr
-                      key={business.id}
+                      key={b.id}
                       className="border-b border-slate-800 hover:bg-slate-800/50 transition-colors"
                     >
-                      <td className="py-3 px-4 text-slate-200">
-                        {business.title}
-                      </td>
+                      <td className="py-3 px-4 text-slate-200">{b.title}</td>
                       <td className="py-3 px-4 text-slate-400 text-xs">
-                        {business.address}
+                        {b.address}
                       </td>
                       <td className="py-3 px-4 text-slate-400">
-                        {business.phone || '-'}
+                        {b.phone_number || '-'}
                       </td>
                       <td className="py-3 px-4 text-slate-400">
-                        {business.rating ? `${business.rating}★` : '-'}
+                        {b.rating ? `${b.rating}★` : '-'}
                       </td>
                       <td className="py-3 px-4 text-slate-400">
-                        {business.category || '-'}
+                        {b.category || '-'}
                       </td>
                       <td className="py-3 px-4">
-                        {business.website ? (
+                        {b.webpage ? (
                           <a
-                            href={business.website}
+                            href={b.webpage}
                             target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-blue-400 hover:text-blue-300 truncate"
+                            rel="noreferrer"
+                            className="text-blue-400 hover:text-blue-300"
                           >
                             Visit
                           </a>
@@ -443,72 +569,6 @@ export default function AutoBusinessFinderPage() {
               </table>
             </div>
           )}
-        </Card>
-
-        {/* Information Cards */}
-        <div className="grid md:grid-cols-2 gap-6">
-          <Card className="bg-slate-900 border-slate-800 p-6">
-            <h3 className="text-lg font-semibold text-white mb-3">
-              Database Tables
-            </h3>
-            <div className="space-y-3 text-sm text-slate-300">
-              <div>
-                <p className="font-medium text-white mb-1">
-                  Google_Maps Searches
-                </p>
-                <p className="text-slate-400">
-                  Source table with 1000+ search queries. Marked as used after
-                  scraping.
-                </p>
-              </div>
-              <div>
-                <p className="font-medium text-white mb-1">
-                  Roofing Leads New
-                </p>
-                <p className="text-slate-400">
-                  Destination table storing all scraped business data with
-                  deduplication.
-                </p>
-              </div>
-            </div>
-          </Card>
-
-          <Card className="bg-slate-900 border-slate-800 p-6">
-            <h3 className="text-lg font-semibold text-white mb-3">
-              Extracted Data Fields
-            </h3>
-            <div className="grid grid-cols-2 gap-2 text-sm text-slate-300">
-              <div>✓ Title</div>
-              <div>✓ Address</div>
-              <div>✓ Phone Number</div>
-              <div>✓ Rating</div>
-              <div>✓ Website</div>
-              <div>✓ Category</div>
-              <div>✓ Working Hours</div>
-              <div>✓ Map Link</div>
-              <div>✓ Cover Image</div>
-              <div>✓ Row Number</div>
-            </div>
-          </Card>
-        </div>
-
-        {/* GitHub Actions Info */}
-        <Card className="bg-slate-900 border-slate-800 p-6 mt-6">
-          <h3 className="text-lg font-semibold text-white mb-3">
-            GitHub Actions Integration
-          </h3>
-          <p className="text-slate-400 mb-4">
-            The scraper runs as a GitHub Actions workflow for reliable,
-            scalable execution. Monitor progress in your GitHub repository:
-          </p>
-          <a
-            href="https://github.com/rileywebboost-afk/UltimateLeadGen/actions"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-2 text-blue-400 hover:text-blue-300 transition-colors"
-          >
-            View GitHub Actions Workflows →
-          </a>
         </Card>
       </main>
     </div>

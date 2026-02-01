@@ -39,6 +39,11 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # A stable run key that the web app can use to query progress.
+          # We set this to the workflow_dispatch input timestamp.
+          RUN_KEY: ${{ github.event.inputs.timestamp }}
+          # Nice-to-have: expose GitHub run id so we can link to the exact run.
+          GITHUB_RUN_ID: ${{ github.run_id }}
           # Optional tuning
           NAV_TIMEOUT_MS: 90000
           ACTION_TIMEOUT_MS: 20000

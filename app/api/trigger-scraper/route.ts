@@ -1,16 +1,19 @@
 /**
  * API Route: Trigger GitHub Actions Scraper
- * 
- * This endpoint triggers a GitHub Actions workflow that:
- * 1. Fetches all unused searches from Supabase "Google_Maps Searches" table
- * 2. Uses headless Playwright browser to scrape Google Maps for each search
- * 3. Extracts business data (title, address, phone, rating, website, etc.)
- * 4. Stores results in Supabase "Roofing Leads New" table
- * 5. Updates searchUSED flag to true for processed searches
- * 
+ *
+ * IMPORTANT:
+ * - GitHub workflow dispatch returns 204 and does NOT directly give a run id.
+ * - We need a stable identifier to correlate UI ↔ GitHub Actions ↔ scraper.
+ *
+ * Approach:
+ * - The web app sends a timestamp ISO string (we generate it here if missing)
+ * - We pass that timestamp into the workflow as workflow_dispatch input
+ * - In the workflow we pass it as RUN_KEY env var
+ * - The scraper writes real-time progress rows into Supabase under run_key
+ *
  * POST /api/trigger-scraper
- * Body: { action: 'start_scraper', timestamp: ISO string }
- * Response: { success: boolean, workflowId: string, message: string }
+ * Body: { action: 'start_scraper', timestamp?: ISO string }
+ * Response: { success: boolean, workflowId: string, runKey: string, message: string }
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -21,11 +24,11 @@ export async function POST(request: NextRequest) {
 
     // Validate request
     if (body.action !== 'start_scraper') {
-      return NextResponse.json(
-        { error: 'Invalid action' },
-        { status: 400 }
-      )
+      return NextResponse.json({ error: 'Invalid action' }, { status: 400 })
     }
+
+    // Stable key to correlate UI with Supabase monitoring rows
+    const runKey: string = body.timestamp || new Date().toISOString()
 
     // Get GitHub token from environment
     const githubToken = process.env.GH_TOKEN
@@ -36,25 +39,21 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    /**
-     * Trigger GitHub Actions workflow dispatch
-     * This calls the GitHub API to start the scraper workflow
-     * The workflow will run in GitHub Actions with headless browser
-     */
+    // 1) Trigger workflow dispatch
     const workflowResponse = await fetch(
       'https://api.github.com/repos/rileywebboost-afk/UltimateLeadGen/actions/workflows/scraper.yml/dispatches',
       {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${githubToken}`,
-          'Accept': 'application/vnd.github.v3+json',
+          Authorization: `Bearer ${githubToken}`,
+          Accept: 'application/vnd.github.v3+json',
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
           ref: 'main',
           inputs: {
             action: 'start_scraper',
-            timestamp: body.timestamp,
+            timestamp: runKey,
           },
         }),
       }
@@ -69,34 +68,39 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    /**
-     * Get the workflow run ID for status tracking
-     * This allows the frontend to poll for progress updates
-     */
-    const runsResponse = await fetch(
-      'https://api.github.com/repos/rileywebboost-afk/UltimateLeadGen/actions/runs?status=in_progress&head_branch=main',
-      {
-        headers: {
-          'Authorization': `Bearer ${githubToken}`,
-          'Accept': 'application/vnd.github.v3+json',
-        },
-      }
-    )
+    // 2) Best-effort: fetch latest in-progress run (may not exist immediately)
+    // NOTE: this is only for linking to GitHub. Real progress comes from Supabase run_key.
+    let workflowId = 'unknown'
+    try {
+      const runsResponse = await fetch(
+        'https://api.github.com/repos/rileywebboost-afk/UltimateLeadGen/actions/runs?per_page=5&head_branch=main',
+        {
+          headers: {
+            Authorization: `Bearer ${githubToken}`,
+            Accept: 'application/vnd.github.v3+json',
+          },
+        }
+      )
 
-    const runsData = await runsResponse.json()
-    const workflowId = runsData.workflow_runs?.[0]?.id || 'unknown'
+      const runsData = await runsResponse.json()
+      // pick the most recent run that is queued/in_progress
+      const run = (runsData.workflow_runs || []).find(
+        (r: any) => r.status === 'in_progress' || r.status === 'queued'
+      )
+      workflowId = run?.id ? String(run.id) : 'unknown'
+    } catch (e) {
+      // ignore
+    }
 
     return NextResponse.json({
       success: true,
       workflowId,
+      runKey,
       message: 'Scraper workflow triggered successfully',
       timestamp: new Date().toISOString(),
     })
   } catch (error) {
     console.error('Error triggering scraper:', error)
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    )
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
