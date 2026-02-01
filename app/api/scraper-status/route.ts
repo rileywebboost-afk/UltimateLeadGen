@@ -34,7 +34,7 @@ export async function GET(request: NextRequest) {
      * This checks if the scraper workflow is still running, completed, or failed
      */
     const statusResponse = await fetch(
-      `https://api.github.com/repos/Halfpro6119/UltimateLeadGen/actions/runs/${workflowId}`,
+      `https://api.github.com/repos/rileywebboost-afk/UltimateLeadGen/actions/runs/${workflowId}`,
       {
         headers: {
           'Authorization': `Bearer ${githubToken}`,

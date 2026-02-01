@@ -58,3 +58,10 @@ Read more: https://nextjs.org/docs/app/api-reference/config/next-config-js/allow
  GET /auto-business-finder 200 in 92ms
  POST /api/trigger-scraper 500 in 263ms
  GET / 200 in 353ms
+ GET /auto-business-finder 200 in 177ms
+ POST /api/trigger-scraper 500 in 309ms
+ POST /api/trigger-scraper 500 in 279ms
+ POST /api/trigger-scraper 500 in 277ms
+ POST /api/trigger-scraper 500 in 279ms
+ POST /api/trigger-scraper 500 in 268ms
+ GET / 200 in 223ms

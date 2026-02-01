@@ -42,7 +42,7 @@ export async function POST(request: NextRequest) {
      * The workflow will run in GitHub Actions with headless browser
      */
     const workflowResponse = await fetch(
-      'https://api.github.com/repos/Halfpro6119/UltimateLeadGen/actions/workflows/scraper.yml/dispatches',
+      'https://api.github.com/repos/rileywebboost-afk/UltimateLeadGen/actions/workflows/scraper.yml/dispatches',
       {
         method: 'POST',
         headers: {
@@ -74,7 +74,7 @@ export async function POST(request: NextRequest) {
      * This allows the frontend to poll for progress updates
      */
     const runsResponse = await fetch(
-      'https://api.github.com/repos/Halfpro6119/UltimateLeadGen/actions/runs?status=in_progress&head_branch=main',
+      'https://api.github.com/repos/rileywebboost-afk/UltimateLeadGen/actions/runs?status=in_progress&head_branch=main',
       {
         headers: {
           'Authorization': `Bearer ${githubToken}`,
