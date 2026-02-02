@@ -332,7 +332,7 @@ async def mark_search_as_used(supabase, search_query: str, monitor) -> bool:
 async def main():
     """Main scraper entry point."""
     supabase = get_supabase_client()
-    monitor = build_monitor(supabase, RUN_KEY, GITHUB_RUN_ID)
+    monitor = build_monitor(supabase)
 
     results = {
         "run_key": RUN_KEY,
