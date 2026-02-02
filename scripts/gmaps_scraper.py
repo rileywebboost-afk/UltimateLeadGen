@@ -19,6 +19,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Any, Optional
@@ -27,7 +28,9 @@ from playwright.async_api import async_playwright, Page, TimeoutError as PwTimeo
 from supabase import create_client
 
 # Monitoring: write real-time progress + event timeline to Supabase
-from scripts.scraper_monitor import build_monitor
+# Use sys.path to handle both local dev and GitHub Actions contexts
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from scraper_monitor import build_monitor
 
 
 # ----------------------------
@@ -39,536 +42,441 @@ ACTION_TIMEOUT_MS = int(os.getenv("ACTION_TIMEOUT_MS", "20000"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars")
-
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+RUN_KEY = os.getenv("RUN_KEY", datetime.utcnow().isoformat())
+GITHUB_RUN_ID = os.getenv("GITHUB_RUN_ID", "unknown")
 
 
 # ----------------------------
-# Helpers
+# Data Models
 # ----------------------------
-
-def normalize_space(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def parse_rating_from_aria(aria: Optional[str]) -> Optional[str]:
-    if not aria:
-        return None
-    # Examples: "4.6 stars" / "4.6 stars from 127 reviews"
-    m = re.search(r"(\d+(?:\.\d+)?)\s*star", aria, re.I)
-    return m.group(1) if m else None
-
-
-async def safe_text(page: Page, selector: str) -> Optional[str]:
-    try:
-        el = await page.query_selector(selector)
-        if not el:
-            return None
-        txt = await el.text_content()
-        return normalize_space(txt) if txt else None
-    except Exception:
-        return None
-
-
-async def safe_attr(page: Page, selector: str, attr: str) -> Optional[str]:
-    try:
-        el = await page.query_selector(selector)
-        if not el:
-            return None
-        val = await el.get_attribute(attr)
-        return val
-    except Exception:
-        return None
-
-
-async def click_if_present(page: Page, selector: str) -> bool:
-    try:
-        el = await page.query_selector(selector)
-        if not el:
-            return False
-        await el.click(timeout=3000)
-        return True
-    except Exception:
-        return False
-
-
-async def handle_google_consent(page: Page) -> None:
-    """Try to dismiss EU/UK consent dialogs if they appear."""
-
-    # Common buttons
-    candidates = [
-        'button:has-text("Reject all")',
-        'button:has-text("Accept all")',
-        'button:has-text("I agree")',
-        'button:has-text("Agree")',
-        'button[aria-label="Reject all"]',
-        'button[aria-label="Accept all"]',
-    ]
-
-    for sel in candidates:
-        clicked = await click_if_present(page, sel)
-        if clicked:
-            await page.wait_for_timeout(500)
-            return
-
-
-# ----------------------------
-# Supabase IO
-# ----------------------------
-
-
-def fetch_unused_searches(limit: int = 1000) -> list[dict[str, Any]]:
-    # Limit to 1000 per run for safety.
-    res = (
-        supabase.table('Google_Maps Searches')
-        .select('Searches,searchUSED')
-        .eq('searchUSED', False)
-        .limit(limit)
-        .execute()
-    )
-    return res.data or []
-
-
-def mark_search_used(search: str) -> None:
-    supabase.table('Google_Maps Searches').update({'searchUSED': True}).eq('Searches', search).execute()
-
-
-def get_next_row_number_start() -> int:
-    # Pull max(RowNumber) once.
-    res = supabase.table('Roofing Leads New').select('RowNumber').order('RowNumber', desc=True).limit(1).execute()
-    if res.data:
-        return int(res.data[0]['RowNumber']) + 1
-    return 1
-
-
-def insert_roofing_lead(row: dict[str, Any]) -> bool:
-    """Insert one lead row. Returns True if inserted or skipped as duplicate."""
-    try:
-        supabase.table('Roofing Leads New').insert(row).execute()
-        return True
-    except Exception as e:
-        # Dedup by unique index on normalized title (partial index).
-        msg = str(e).lower()
-        if 'duplicate' in msg or 'unique' in msg:
-            return True
-        print(f"    DB insert error: {str(e)[:200]}")
-        return False
-
-
-# ----------------------------
-# Scraping
-# ----------------------------
-
-
 @dataclass
 class Business:
-    title: Optional[str] = None
+    """Extracted business data from Google Maps listing."""
+
+    title: str
+    address: str
+    phone_number: Optional[str] = None
+    rating: Optional[str] = None
+    webpage: Optional[str] = None
+    category: Optional[str] = None
+    working_hours: Optional[str] = None
     map_link: Optional[str] = None
     cover_image: Optional[str] = None
-    rating: Optional[str] = None
-    category: Optional[str] = None
-    address: Optional[str] = None
-    webpage: Optional[str] = None
-    phone_number: Optional[str] = None
-    working_hours: Optional[str] = None
 
 
-async def wait_for_results(page: Page) -> bool:
-    """Wait until the results feed shows up or we detect no-results."""
+# ----------------------------
+# Supabase Client
+# ----------------------------
+def get_supabase_client():
+    """Initialize Supabase client."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set")
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+
+# ----------------------------
+# Scraper Logic
+# ----------------------------
+async def extract_business_details(page: Page, listing_url: str) -> Optional[Business]:
+    """
+    Extract business details from a Google Maps listing page.
+
+    Args:
+        page: Playwright page object
+        listing_url: URL of the listing
+
+    Returns:
+        Business object or None if extraction fails
+    """
     try:
-        await page.wait_for_selector('div[role="feed"]', timeout=30000)
-        return True
-    except Exception:
-        # sometimes results container uses role="main" only; fall back
-        try:
-            await page.wait_for_selector('div[role="main"]', timeout=5000)
-            return True
-        except Exception:
-            return False
+        await page.goto(listing_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        await page.wait_for_timeout(1000)  # Let page settle
 
+        # Extract title
+        title_selector = 'h1[data-attrid="title"]'
+        title_elem = await page.query_selector(title_selector)
+        title = (await title_elem.text_content()).strip() if title_elem else "Unknown"
 
-async def get_listing_cards(page: Page) -> list:
-    """Return clickable listing cards."""
-    # Primary card container in search results
-    cards = await page.query_selector_all('div.Nv2PK')
-    if cards:
-        return cards
+        # Extract address
+        address_selector = 'button[data-item-id="address"]'
+        address_elem = await page.query_selector(address_selector)
+        address = (await address_elem.text_content()).strip() if address_elem else ""
 
-    # fallback: anchor to listing
-    cards = await page.query_selector_all('a.hfpxzc')
-    if cards:
-        return cards
+        # Extract phone
+        phone_selector = 'button[data-item-id="phone:tel"]'
+        phone_elem = await page.query_selector(phone_selector)
+        phone = (await phone_elem.text_content()).strip() if phone_elem else None
 
-    # last resort
-    return await page.query_selector_all('[data-item-id]')
+        # Extract rating
+        rating_selector = 'div[role="img"][aria-label*="stars"]'
+        rating_elem = await page.query_selector(rating_selector)
+        rating = None
+        if rating_elem:
+            aria_label = await rating_elem.get_attribute("aria-label")
+            if aria_label:
+                match = re.search(r"([\d.]+)\s*star", aria_label)
+                rating = match.group(1) if match else None
 
+        # Extract website
+        website_selector = 'a[data-item-id="website"]'
+        website_elem = await page.query_selector(website_selector)
+        website = await website_elem.get_attribute("href") if website_elem else None
 
-async def extract_details(page: Page) -> Optional[Business]:
-    # Title
-    title = await safe_text(page, 'h1.DUwDvf') or await safe_text(page, 'h1')
-    if not title:
+        # Extract category
+        category_selector = 'button[jsname="x8hlje"]'
+        category_elem = await page.query_selector(category_selector)
+        category = (await category_elem.text_content()).strip() if category_elem else None
+
+        # Extract working hours
+        hours_selector = 'div[data-item-id="oh"]'
+        hours_elem = await page.query_selector(hours_selector)
+        working_hours = (await hours_elem.text_content()).strip() if hours_elem else None
+
+        return Business(
+            title=title,
+            address=address,
+            phone_number=phone,
+            rating=rating,
+            webpage=website,
+            category=category,
+            working_hours=working_hours,
+            map_link=listing_url,
+        )
+    except Exception as e:
+        print(f"Error extracting business details from {listing_url}: {e}")
         return None
 
-    # Rating
-    aria = await safe_attr(page, 'span[aria-label*="star"]', 'aria-label')
-    rating = parse_rating_from_aria(aria)
 
-    # Category (often a button near top)
-    category = await safe_text(page, 'button.DkEaL') or await safe_text(page, 'span.DkEaL')
+async def scrape_search(
+    page: Page, search_query: str, search_index: int, total_searches: int, monitor
+) -> tuple[list[Business], int]:
+    """
+    Scrape Google Maps for a single search query.
 
-    # Address, phone, website use data-item-id in details panel (most reliable)
-    address = await safe_text(page, '[data-item-id="address"] .Io6YTe') or await safe_text(page, '[data-item-id="address"] .rogA2c')
-    phone = await safe_text(page, '[data-item-id^="phone"] .Io6YTe') or await safe_text(page, '[data-item-id^="phone"] .rogA2c')
+    Args:
+        page: Playwright page object
+        search_query: Search query to execute
+        search_index: Current search index (for progress tracking)
+        total_searches: Total number of searches
+        monitor: Monitor object for logging progress
 
-    website = (
-        await safe_attr(page, 'a[data-item-id="authority"]', 'href')
-        or await safe_attr(page, '[data-item-id="authority"] a', 'href')
-    )
-
-    # Hours
-    hours = await safe_text(page, '[data-item-id="oh"] .Io6YTe') or await safe_text(page, '[data-item-id="oh"] .rogA2c')
-
-    # Cover image (best effort)
-    cover = await safe_attr(page, 'img[src^="https://lh5.googleusercontent.com"]', 'src')
-
-    return Business(
-        title=title,
-        map_link=page.url,
-        cover_image=cover,
-        rating=rating,
-        category=category,
-        address=address,
-        webpage=website,
-        phone_number=phone,
-        working_hours=hours,
-    )
-
-
-async def scrape_search(page: Page, query: str) -> tuple[list[Business], bool, str | None]:
-    """Returns (businesses, loaded_ok, error_message)"""
-
-    url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}"
+    Returns:
+        Tuple of (businesses list, count of businesses extracted)
+    """
+    businesses = []
+    extracted_count = 0
 
     try:
-        await page.goto(url, wait_until='domcontentloaded', timeout=NAV_TIMEOUT_MS)
-        await page.wait_for_timeout(750)
-        await handle_google_consent(page)
+        # Log search start
+        await monitor.log_event(
+            "SEARCH_START",
+            f"Starting search: {search_query}",
+            search=search_query,
+            search_index=search_index,
+        )
 
-        ok = await wait_for_results(page)
-        if not ok:
-            return [], False, "results_not_found"
+        # Navigate to Google Maps search
+        search_url = f"https://www.google.com/maps/search/{search_query.replace(' ', '+')}"
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        await page.wait_for_timeout(2000)
 
-        # Collect cards (ensure not empty)
-        cards = await get_listing_cards(page)
-        if not cards:
-            return [], True, "no_cards_found"
+        # Wait for listing cards to appear
+        listing_selector = 'div[role="button"][jsaction*="click"]'
+        await page.wait_for_selector(listing_selector, timeout=ACTION_TIMEOUT_MS)
 
-        businesses: list[Business] = []
+        # Get all listing cards
+        listings = await page.query_selector_all(listing_selector)
+        listings_count = len(listings)
 
-        # Click through first N cards
-        for i, card in enumerate(cards[:MAX_RESULTS_PER_SEARCH]):
+        await monitor.log_event(
+            "LISTINGS_FOUND",
+            f"Found {listings_count} listings for search: {search_query}",
+            search=search_query,
+            search_index=search_index,
+        )
+
+        # Extract details from each listing (limit to MAX_RESULTS_PER_SEARCH)
+        for i, listing in enumerate(listings[: MAX_RESULTS_PER_SEARCH]):
             try:
-                await card.click(timeout=ACTION_TIMEOUT_MS)
-                # Wait for details panel title to render
-                try:
-                    await page.wait_for_selector('h1.DUwDvf, h1', timeout=ACTION_TIMEOUT_MS)
-                except Exception:
-                    pass
+                # Click listing to open details
+                await listing.click()
+                await page.wait_for_timeout(1500)
 
-                b = await extract_details(page)
-                if b and b.title:
-                    businesses.append(b)
-            except PwTimeout:
+                # Get listing URL
+                listing_url = page.url
+
+                # Extract business details
+                business = await extract_business_details(page, listing_url)
+                if business:
+                    businesses.append(business)
+                    extracted_count += 1
+
+                    await monitor.log_event(
+                        "EXTRACT",
+                        f"Extracted: {business.title}",
+                        search=search_query,
+                        search_index=search_index,
+                        businesses_extracted=extracted_count,
+                    )
+
+            except Exception as e:
+                await monitor.log_event(
+                    "EXTRACT_ERROR",
+                    f"Error extracting listing {i + 1}: {str(e)}",
+                    search=search_query,
+                    search_index=search_index,
+                    level="warn",
+                )
                 continue
-            except Exception:
-                continue
 
-        return businesses, True, None
+        await monitor.log_event(
+            "SEARCH_COMPLETE",
+            f"Completed search: {search_query} ({extracted_count} businesses extracted)",
+            search=search_query,
+            search_index=search_index,
+            businesses_extracted=extracted_count,
+        )
 
-    except PwTimeout:
-        return [], False, "goto_timeout"
+        return businesses, extracted_count
+
     except Exception as e:
-        return [], False, f"error:{str(e)[:120]}"
+        await monitor.log_event(
+            "SEARCH_ERROR",
+            f"Error during search '{search_query}': {str(e)}",
+            search=search_query,
+            search_index=search_index,
+            level="error",
+        )
+        return [], 0
 
 
-async def run() -> dict[str, Any]:
-    started = datetime.now().isoformat()
+async def insert_businesses_to_db(
+    supabase, businesses: list[Business], monitor
+) -> tuple[int, int]:
+    """
+    Insert businesses into Supabase, handling duplicates.
 
-    # Build monitoring helper (safe no-op if RUN_KEY env var is missing)
-    monitor = build_monitor(supabase)
-    if monitor:
-        monitor.upsert_progress({
-            "status": "initializing",
-            "current_action": "boot",
-            "started_at": started,
-        })
-        monitor.add_event("INIT", "Scraper initializing (Playwright + Supabase)")
+    Args:
+        supabase: Supabase client
+        businesses: List of Business objects to insert
+        monitor: Monitor object for logging
 
-    searches = fetch_unused_searches(limit=1000)
+    Returns:
+        Tuple of (inserted count, skipped count)
+    """
+    inserted = 0
+    skipped = 0
 
-    if monitor:
-        monitor.upsert_progress({
-            "status": "running",
-            "current_action": "loaded_search_queue",
-            "total_searches": len(searches),
-        })
-        monitor.add_event("QUEUE", f"Loaded {len(searches)} unused searches from Supabase")
+    for business in businesses:
+        try:
+            # Check if business already exists (by title)
+            existing = supabase.table("Roofing Leads New").select("id").eq("title", business.title).execute()
 
-    results: dict[str, Any] = {
-        "started_at": started,
-        "finished_at": None,
-        "searches_total": len(searches),
-        "searches_loaded_ok": 0,
-        "searches_marked_used": 0,
-        "searches_errors": 0,
+            if existing.data:
+                skipped += 1
+                await monitor.log_event(
+                    "DB_SKIP",
+                    f"Skipped duplicate: {business.title}",
+                    level="info",
+                )
+            else:
+                # Insert new business
+                supabase.table("Roofing Leads New").insert(asdict(business)).execute()
+                inserted += 1
+                await monitor.log_event(
+                    "DB_INSERT",
+                    f"Inserted: {business.title}",
+                    level="info",
+                )
+
+        except Exception as e:
+            await monitor.log_event(
+                "DB_ERROR",
+                f"Error inserting business '{business.title}': {str(e)}",
+                level="error",
+            )
+            skipped += 1
+
+    return inserted, skipped
+
+
+async def mark_search_as_used(supabase, search_query: str, monitor) -> bool:
+    """
+    Mark a search as used in the database.
+
+    Args:
+        supabase: Supabase client
+        search_query: Search query to mark as used
+        monitor: Monitor object for logging
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        supabase.table("Google_Maps Searches").update({"searchUSED": True}).eq("Searches", search_query).execute()
+        await monitor.log_event(
+            "SEARCH_MARKED_USED",
+            f"Marked search as used: {search_query}",
+            level="info",
+        )
+        return True
+    except Exception as e:
+        await monitor.log_event(
+            "MARK_USED_ERROR",
+            f"Error marking search as used '{search_query}': {str(e)}",
+            level="error",
+        )
+        return False
+
+
+async def main():
+    """Main scraper entry point."""
+    supabase = get_supabase_client()
+    monitor = build_monitor(supabase, RUN_KEY, GITHUB_RUN_ID)
+
+    results = {
+        "run_key": RUN_KEY,
+        "github_run_id": GITHUB_RUN_ID,
+        "status": "failed",
+        "total_searches": 0,
+        "searches_processed": 0,
         "businesses_extracted": 0,
-        "businesses_inserted_or_skipped": 0,
-        "sample_errors": [],
+        "businesses_inserted": 0,
+        "businesses_skipped": 0,
+        "searches_marked_used": 0,
+        "errors": [],
+        "timestamp": datetime.utcnow().isoformat(),
     }
 
-    row_number = get_next_row_number_start()
+    try:
+        # Log initialization
+        await monitor.log_event("INIT", "Scraper initialized", level="info")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled',
-            ],
-        )
-        context = await browser.new_context(
-            locale='en-GB',
-            timezone_id='Europe/London',
-            viewport={"width": 1280, "height": 800},
-            user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
-        )
-        page = await context.new_page()
-        page.set_default_timeout(ACTION_TIMEOUT_MS)
+        # Fetch unused searches from Supabase
+        await monitor.log_event("FETCH_SEARCHES", "Fetching unused searches from database", level="info")
 
-        for idx, s in enumerate(searches):
-            query = s["Searches"]
+        searches_response = supabase.table("Google_Maps Searches").select("Searches").eq("searchUSED", False).execute()
 
-            # ---------------------------------------------------------
-            # Monitoring: announce which search we are about to run.
-            # This is the key missing piece for UI visibility.
-            # ---------------------------------------------------------
-            if monitor:
-                monitor.upsert_progress({
-                    "status": "running",
-                    "current_action": "loading_search",
-                    "current_search": query,
-                    "current_search_index": idx + 1,
-                    "total_searches": len(searches),
-                    "searches_processed": idx,
-                    "businesses_extracted": results["businesses_extracted"],
-                    "businesses_inserted_or_skipped": results["businesses_inserted_or_skipped"],
-                    "searches_marked_used": results["searches_marked_used"],
-                    "searches_loaded_ok": results["searches_loaded_ok"],
-                    "searches_errors": results["searches_errors"],
-                })
-                monitor.add_event(
-                    "SEARCH_START",
-                    f"Starting search: {query}",
-                    search=query,
-                    search_index=idx + 1,
-                )
+        searches = [row["Searches"] for row in searches_response.data] if searches_response.data else []
+        results["total_searches"] = len(searches)
 
-            print(f"[{idx+1}/{len(searches)}] {query}")
+        if not searches:
+            await monitor.log_event("NO_SEARCHES", "No unused searches found", level="warn")
+            results["status"] = "completed"
+            results["searches_processed"] = 0
+            await monitor.update_progress(
+                status="completed",
+                searches_processed=0,
+                total_searches=0,
+            )
+        else:
+            await monitor.log_event(
+                "SEARCHES_LOADED",
+                f"Loaded {len(searches)} unused searches",
+                level="info",
+            )
 
-            # ---------------------------------------------------------
-            # Run the actual Google Maps scraping for this search.
-            # ---------------------------------------------------------
-            businesses, loaded_ok, err = await scrape_search(page, query)
+            # Launch browser
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
 
-            if loaded_ok:
-                results["searches_loaded_ok"] += 1
+                total_extracted = 0
+                total_inserted = 0
+                total_skipped = 0
+                searches_marked = 0
 
-            if err:
-                results["searches_errors"] += 1
-                if len(results["sample_errors"]) < 25:
-                    results["sample_errors"].append({"search": query, "error": err})
+                # Process each search
+                for idx, search_query in enumerate(searches, 1):
+                    try:
+                        # Update progress
+                        await monitor.update_progress(
+                            status="running",
+                            current_search=search_query,
+                            current_search_index=idx,
+                            total_searches=len(searches),
+                            searches_processed=idx - 1,
+                        )
 
-                if monitor:
-                    monitor.add_event(
-                        "SEARCH_ERROR",
-                        f"Search produced an error: {err}",
-                        level="warn",
-                        search=query,
-                        search_index=idx + 1,
-                    )
+                        # Scrape search
+                        businesses, extracted = await scrape_search(page, search_query, idx, len(searches), monitor)
 
-            # ---------------------------------------------------------
-            # Monitoring: how many businesses did we extract?
-            # ---------------------------------------------------------
-            results["businesses_extracted"] += len(businesses)
+                        if businesses:
+                            # Insert to database
+                            inserted, skipped = await insert_businesses_to_db(supabase, businesses, monitor)
+                            total_extracted += extracted
+                            total_inserted += inserted
+                            total_skipped += skipped
 
-            if monitor:
-                monitor.upsert_progress({
-                    "current_action": "extracted_businesses",
-                    "businesses_extracted": results["businesses_extracted"],
-                    "searches_loaded_ok": results["searches_loaded_ok"],
-                    "searches_errors": results["searches_errors"],
-                })
-                monitor.add_event(
-                    "EXTRACT",
-                    f"Extracted {len(businesses)} businesses",
-                    search=query,
-                    search_index=idx + 1,
-                    businesses_extracted=len(businesses),
-                )
+                            # Mark search as used
+                            if await mark_search_as_used(supabase, search_query, monitor):
+                                searches_marked += 1
 
-            # ---------------------------------------------------------
-            # Insert businesses into Supabase
-            # ---------------------------------------------------------
-            inserted_this_search = 0
-            for b in businesses:
-                row = {
-                    "RowNumber": row_number,
-                    "title": b.title,
-                    "map_link": b.map_link,
-                    "cover_image": b.cover_image,
-                    "rating": b.rating,
-                    "category": b.category,
-                    "address": b.address,
-                    "webpage": b.webpage,
-                    "phone_number": b.phone_number,
-                    "working_hours": b.working_hours,
-                    "Used": False,
-                }
-                ok = insert_roofing_lead(row)
-                if ok:
-                    results["businesses_inserted_or_skipped"] += 1
-                    inserted_this_search += 1
-                row_number += 1
+                        results["searches_processed"] = idx
+                        results["businesses_extracted"] = total_extracted
+                        results["businesses_inserted"] = total_inserted
+                        results["businesses_skipped"] = total_skipped
+                        results["searches_marked_used"] = searches_marked
 
-            if monitor:
-                monitor.upsert_progress({
-                    "current_action": "inserted_businesses",
-                    "businesses_inserted_or_skipped": results["businesses_inserted_or_skipped"],
-                })
-                monitor.add_event(
-                    "DB_INSERT",
-                    f"Inserted/skipped {inserted_this_search} businesses into Roofing Leads New",
-                    search=query,
-                    search_index=idx + 1,
-                    businesses_inserted_or_skipped=inserted_this_search,
-                )
+                    except Exception as e:
+                        error_msg = f"Error processing search '{search_query}': {str(e)}"
+                        results["errors"].append(error_msg)
+                        await monitor.log_event(
+                            "SEARCH_FATAL",
+                            error_msg,
+                            search=search_query,
+                            search_index=idx,
+                            level="error",
+                        )
 
-            # ---------------------------------------------------------
-            # Mark search used ONLY if we successfully loaded results.
-            # ---------------------------------------------------------
-            if loaded_ok:
-                if monitor:
-                    monitor.upsert_progress({
-                        "current_action": "marking_search_used",
-                    })
+                await browser.close()
 
-                mark_search_used(query)
-                results["searches_marked_used"] += 1
+            results["status"] = "completed"
 
-                if monitor:
-                    monitor.upsert_progress({
-                        "current_action": "search_marked_used",
-                        "searches_marked_used": results["searches_marked_used"],
-                    })
-                    monitor.add_event(
-                        "SEARCH_MARK_USED",
-                        "Marked search as used in Google_Maps Searches",
-                        search=query,
-                        search_index=idx + 1,
-                        searches_marked_used=1,
-                    )
+            # Final progress update
+            await monitor.update_progress(
+                status="completed",
+                searches_processed=len(searches),
+                total_searches=len(searches),
+                businesses_extracted=total_extracted,
+                businesses_inserted_or_skipped=total_inserted + total_skipped,
+                searches_marked_used=searches_marked,
+            )
 
-            # ---------------------------------------------------------
-            # Gentle pacing (and a convenient heartbeat for monitoring)
-            # ---------------------------------------------------------
-            if monitor:
-                monitor.upsert_progress({
-                    "searches_processed": idx + 1,
-                    "current_action": "waiting_between_searches",
-                })
+            await monitor.log_event(
+                "COMPLETE",
+                f"Scraper completed: {total_extracted} extracted, {total_inserted} inserted, {total_skipped} skipped, {searches_marked} searches marked used",
+                level="info",
+            )
 
-            await page.wait_for_timeout(750)
+    except Exception as e:
+        error_msg = f"Fatal scraper error: {str(e)}"
+        results["status"] = "failed"
+        results["errors"].append(error_msg)
 
+        await monitor.log_event("FATAL", error_msg, level="error")
+        await monitor.update_progress(status="failed", error_message=error_msg)
 
-        
+    finally:
+        # Write results to file for artifact upload
+        with open("scraper_results.json", "w") as f:
+            json.dump(results, f, indent=2)
 
-        await context.close()
-        await browser.close()
-
-    results["finished_at"] = datetime.now().isoformat()
-
-    # Monitoring: mark run completed
-    if monitor:
-        monitor.upsert_progress({
-            "status": "completed",
-            "current_action": "completed",
-            "businesses_extracted": results["businesses_extracted"],
-            "businesses_inserted_or_skipped": results["businesses_inserted_or_skipped"],
-            "searches_loaded_ok": results["searches_loaded_ok"],
-            "searches_errors": results["searches_errors"],
-            "searches_marked_used": results["searches_marked_used"],
-            "searches_processed": results["searches_total"],
-            "completed_at": results["finished_at"],
-        })
-        monitor.add_event(
-            "COMPLETE",
-            f"Scraper completed. Inserted/skipped {results['businesses_inserted_or_skipped']} total businesses.",
-        )
-
-    return results
-
-
-def write_results_file(payload: dict[str, Any]) -> None:
-    with open("scraper_results.json", "w") as f:
-        json.dump(payload, f, indent=2)
+        print(f"\n{'='*60}")
+        print(f"Scraper Results: {results['status'].upper()}")
+        print(f"{'='*60}")
+        print(f"Total Searches: {results['total_searches']}")
+        print(f"Searches Processed: {results['searches_processed']}")
+        print(f"Businesses Extracted: {results['businesses_extracted']}")
+        print(f"Businesses Inserted: {results['businesses_inserted']}")
+        print(f"Businesses Skipped: {results['businesses_skipped']}")
+        print(f"Searches Marked Used: {results['searches_marked_used']}")
+        if results["errors"]:
+            print(f"\nErrors ({len(results['errors'])}):")
+            for error in results["errors"]:
+                print(f"  - {error}")
+        print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
-    out: dict[str, Any]
-    try:
-        out = asyncio.run(run())
-    except Exception as e:
-        out = {
-            "started_at": datetime.now().isoformat(),
-            "finished_at": datetime.now().isoformat(),
-            "status": "fatal_error",
-            "error": str(e),
-        }
-
-        # Monitoring: mark run failed (best-effort)
-        try:
-            monitor = build_monitor(supabase)
-            if monitor:
-                monitor.upsert_progress({
-                    "status": "failed",
-                    "current_action": "failed",
-                    "error_message": str(e)[:500],
-                    "completed_at": out["finished_at"],
-                })
-                monitor.add_event(
-                    "FATAL",
-                    f"Scraper crashed: {str(e)[:200]}",
-                    level="error",
-                )
-        except Exception:
-            pass
-
-        raise
-    finally:
-        # Always create results file for artifact upload
-        try:
-            if "out" not in locals():
-                out = {
-                    "started_at": datetime.now().isoformat(),
-                    "finished_at": datetime.now().isoformat(),
-                    "status": "unknown_state",
-                }
-            write_results_file(out)
-            print("Wrote scraper_results.json")
-        except Exception:
-            pass
+    asyncio.run(main())
