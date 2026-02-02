@@ -14,6 +14,12 @@ This allows the web app to show:
 Design choice:
 - The stable identifier is RUN_KEY which is the workflow_dispatch input timestamp
   sent by the web app. This is unique per "Start" click.
+
+IMPORTANT
+- The Supabase Python client is synchronous.
+- The scraper code uses an *async* interface ("await monitor.log_event(...)"),
+  so we provide async wrappers that call the sync methods.
+- Monitoring must never crash the scraper.
 """
 
 from __future__ import annotations
@@ -28,6 +34,11 @@ def _now_iso() -> str:
 
 
 class ScraperMonitor:
+    """Writes progress + event timeline into Supabase.
+
+    Methods are intentionally defensive: failures never raise.
+    """
+
     def __init__(self, supabase_client, run_key: str, github_run_id: Optional[str] = None):
         self.supabase = supabase_client
         self.run_key = run_key
@@ -52,7 +63,6 @@ class ScraperMonitor:
             # Upsert on run_key
             self.supabase.table("scraper_progress").upsert(base, on_conflict="run_key").execute()
         except Exception:
-            # never fail scraper because of monitoring
             return
 
     # -----------------------------
@@ -88,13 +98,42 @@ class ScraperMonitor:
         except Exception:
             return
 
+    # -----------------------------------------------------------------
+    # Async compatibility layer (expected by gmaps_scraper.py)
+    # -----------------------------------------------------------------
+    async def log_event(self, event_type: str, message: str, **kwargs: Any) -> None:
+        """Async wrapper for add_event()."""
 
-def build_monitor(supabase_client) -> Optional[ScraperMonitor]:
-    """Factory: returns ScraperMonitor if RUN_KEY is available, else None."""
+        self.add_event(event_type, message, **kwargs)
+
+    async def update_progress(self, **kwargs: Any) -> None:
+        """Async wrapper for upsert_progress()."""
+
+        self.upsert_progress(kwargs)
+
+
+class _NoOpMonitor:
+    """A monitor that does nothing.
+
+    Returned when RUN_KEY isn't present, so the scraper still runs.
+    """
+
+    async def log_event(self, *args: Any, **kwargs: Any) -> None:
+        return
+
+    async def update_progress(self, *args: Any, **kwargs: Any) -> None:
+        return
+
+
+def build_monitor(supabase_client):
+    """Factory: returns an async monitor.
+
+    If RUN_KEY is missing, returns a no-op monitor.
+    """
 
     run_key = os.getenv("RUN_KEY")
     if not run_key:
-        return None
+        return _NoOpMonitor()
 
     github_run_id = os.getenv("GITHUB_RUN_ID")
     return ScraperMonitor(supabase_client, run_key=run_key, github_run_id=github_run_id)

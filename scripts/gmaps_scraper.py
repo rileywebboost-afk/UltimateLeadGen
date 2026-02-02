@@ -364,7 +364,7 @@ async def main():
             await monitor.log_event("NO_SEARCHES", "No unused searches found", level="warn")
             results["status"] = "completed"
             results["searches_processed"] = 0
-            await monitor.update_progress(
+            monitor.update_progress(
                 status="completed",
                 searches_processed=0,
                 total_searches=0,
@@ -390,7 +390,7 @@ async def main():
                 for idx, search_query in enumerate(searches, 1):
                     try:
                         # Update progress
-                        await monitor.update_progress(
+                        monitor.update_progress(
                             status="running",
                             current_search=search_query,
                             current_search_index=idx,
@@ -434,7 +434,7 @@ async def main():
             results["status"] = "completed"
 
             # Final progress update
-            await monitor.update_progress(
+            monitor.update_progress(
                 status="completed",
                 searches_processed=len(searches),
                 total_searches=len(searches),
@@ -455,7 +455,7 @@ async def main():
         results["errors"].append(error_msg)
 
         await monitor.log_event("FATAL", error_msg, level="error")
-        await monitor.update_progress(status="failed", error_message=error_msg)
+        monitor.update_progress(status="failed", error_message=error_msg)
 
     finally:
         # Write results to file for artifact upload
