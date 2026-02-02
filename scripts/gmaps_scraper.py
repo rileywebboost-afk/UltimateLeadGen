@@ -72,7 +72,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 # ----------------------------
 # Business Extraction
 # ----------------------------
-async def extract_business_details(page: Page, listing_url: str) -> Optional[Business]:
+async def extract_business_details(page: Page, listing_url: str, search_index: int, monitor) -> Optional[Business]:
     """
     Extract business details from a Google Maps listing detail page.
     
@@ -82,6 +82,8 @@ async def extract_business_details(page: Page, listing_url: str) -> Optional[Bus
     Args:
         page: Playwright page object
         listing_url: URL of the listing
+        search_index: Search index for logging
+        monitor: Monitor object for logging
         
     Returns:
         Business object or None if extraction fails
@@ -90,26 +92,39 @@ async def extract_business_details(page: Page, listing_url: str) -> Optional[Bus
         # Wait for page to load
         await page.wait_for_timeout(1000)
         
+        # DEBUG: Save screenshot to understand DOM structure
+        screenshot_path = f"/tmp/listing_{search_index}.png"
+        await page.screenshot(path=screenshot_path)
+        print(f"  📸 Screenshot saved: {screenshot_path}")
+        
         # Extract title - try multiple selectors
         title = None
         title_selectors = [
             'h1',  # Primary heading
             'div[role="heading"]',  # Heading role
             'div.fontHeadlineSmall',  # Google Maps class
+            'h2',  # Secondary heading
+            'span.fontHeadlineSmall',  # Span variant
         ]
         for selector in title_selectors:
             try:
                 elem = await page.query_selector(selector)
                 if elem:
                     text = await elem.text_content()
-                    if text and text.strip():
+                    if text and text.strip() and len(text.strip()) > 2:
                         title = text.strip()
+                        print(f"    ✓ Title found with '{selector}': {title[:50]}")
                         break
             except:
                 continue
         
         if not title:
             print(f"  ⚠️  Could not extract title from {listing_url}")
+            await monitor.log_event(
+                "EXTRACT_NO_TITLE",
+                f"Could not extract title from listing",
+                level="warn",
+            )
             return None
         
         # Extract address - try multiple selectors
@@ -119,6 +134,7 @@ async def extract_business_details(page: Page, listing_url: str) -> Optional[Bus
             'div[data-item-id="address"]',
             'button[aria-label*="address"]',
             'div.fontBodyMedium:has-text("Address")',
+            'span[data-item-id="address"]',
         ]
         for selector in address_selectors:
             try:
@@ -127,6 +143,7 @@ async def extract_business_details(page: Page, listing_url: str) -> Optional[Bus
                     text = await elem.text_content()
                     if text and text.strip():
                         address = text.strip()
+                        print(f"    ✓ Address found with '{selector}': {address[:50]}")
                         break
             except:
                 continue
@@ -138,6 +155,7 @@ async def extract_business_details(page: Page, listing_url: str) -> Optional[Bus
             'a[data-item-id="phone:tel"]',
             'button[aria-label*="phone"]',
             'a[href^="tel:"]',
+            'span[data-item-id="phone:tel"]',
         ]
         for selector in phone_selectors:
             try:
@@ -146,6 +164,7 @@ async def extract_business_details(page: Page, listing_url: str) -> Optional[Bus
                     text = await elem.text_content()
                     if text and text.strip():
                         phone = text.strip()
+                        print(f"    ✓ Phone found with '{selector}': {phone}")
                         break
             except:
                 continue
@@ -156,6 +175,7 @@ async def extract_business_details(page: Page, listing_url: str) -> Optional[Bus
             'div[role="img"][aria-label*="stars"]',
             'div[aria-label*="star"]',
             'span.fontBodyMedium:has-text("★")',
+            'div[aria-label*="rating"]',
         ]
         for selector in rating_selectors:
             try:
@@ -166,6 +186,7 @@ async def extract_business_details(page: Page, listing_url: str) -> Optional[Bus
                         match = re.search(r"([\d.]+)\s*star", aria_label)
                         if match:
                             rating = match.group(1)
+                            print(f"    ✓ Rating found: {rating}")
                             break
             except:
                 continue
@@ -176,14 +197,16 @@ async def extract_business_details(page: Page, listing_url: str) -> Optional[Bus
             'a[data-item-id="website"]',
             'a[aria-label*="website"]',
             'a[href*="http"]:not([href*="google.com"])',
+            'a[data-item-id="website"] >> nth=0',
         ]
         for selector in website_selectors:
             try:
                 elem = await page.query_selector(selector)
                 if elem:
                     href = await elem.get_attribute("href")
-                    if href and href.strip():
+                    if href and href.strip() and href.startswith("http"):
                         website = href.strip()
+                        print(f"    ✓ Website found: {website[:50]}")
                         break
             except:
                 continue
@@ -196,6 +219,7 @@ async def extract_business_details(page: Page, listing_url: str) -> Optional[Bus
                 text = await elem.text_content()
                 if text:
                     category = text.strip()
+                    print(f"    ✓ Category found: {category}")
         except:
             pass
         
@@ -207,6 +231,7 @@ async def extract_business_details(page: Page, listing_url: str) -> Optional[Bus
                 text = await elem.text_content()
                 if text:
                     working_hours = text.strip()
+                    print(f"    ✓ Hours found: {working_hours[:50]}")
         except:
             pass
         
@@ -227,6 +252,11 @@ async def extract_business_details(page: Page, listing_url: str) -> Optional[Bus
         
     except Exception as e:
         print(f"  ✗ Error extracting from {listing_url}: {str(e)}")
+        await monitor.log_event(
+            "EXTRACT_ERROR",
+            f"Error extracting business: {str(e)}",
+            level="error",
+        )
         return None
 
 
@@ -273,6 +303,7 @@ async def scrape_search(
             'div[role="button"]',  # Fallback: any button role
             'div.Nv2PK',  # Google Maps listing class
             'div[data-item-id]',  # Data attribute selector
+            'div[jsaction*="click"]',  # JSAction selector
         ]
         
         listings = []
@@ -311,7 +342,7 @@ async def scrape_search(
                 listing_url = page.url
 
                 # Extract business details
-                business = await extract_business_details(page, listing_url)
+                business = await extract_business_details(page, listing_url, search_index, monitor)
                 if business:
                     businesses.append(business)
                     extracted_count += 1
