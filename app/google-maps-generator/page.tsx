@@ -150,12 +150,8 @@ export default function GoogleMapsGeneratorPage() {
       const data = await response.json()
 
       // Update search statuses based on insertion result
-      const updated = searches.map((s) => ({
-        ...s,
-        status: data.data.alreadyExisted > 0 ? 'exists' : 'new',
-      }))
-
-      setSearches(updated)
+      // Keep original searches without modifying status
+      setSearches(searches)
       setInsertSuccess(
         `Successfully inserted ${data.data.inserted} new searches. ${data.data.alreadyExisted} already existed.`
       )

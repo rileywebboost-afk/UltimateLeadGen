@@ -34,7 +34,7 @@ export async function checkExistingSearches(searches: string[]): Promise<Set<str
     }
 
     // Add all existing searches to the set
-    data?.forEach((row: any) => existing.add(row.Searches))
+    data?.forEach((row: { Searches: string }) => existing.add(row.Searches))
   }
 
   return existing
